@@ -4,7 +4,10 @@
 //! stream reads or writes as it would a device's, on PipeWire's clock.
 //!
 //! One thread runs PipeWire's loop and owns the devices; [`VirtualAudio`]
-//! asks it to add them, and dropping a [`VirtualDevice`] removes it.
+//! asks it to add them, and dropping a [`VirtualDevice`] removes it. Each
+//! is a network device to the desktop (`node.network`), and runs at the
+//! rate PipeWire's graph runs at by default ([`VirtualAudio::rate`]),
+//! whatever rate its stream runs at, which the stream's side converts to.
 //! Elsewhere than Linux, starting says it is not supported.
 
 use std::io;
@@ -53,6 +56,13 @@ impl VirtualAudio {
         Ok(VirtualAudio {
             inner: imp::Audio::start()?,
         })
+    }
+
+    /// The rate PipeWire's graph runs at by default, `default.clock.rate`,
+    /// normally 48 kHz: the rate to give devices, as one at another rate
+    /// has PipeWire convert, and the stream's side converts too.
+    pub fn rate(&self) -> u32 {
+        self.inner.rate()
     }
 
     /// Adds a virtual device.
@@ -104,6 +114,7 @@ mod imp {
         sender: pw::channel::Sender<Command>,
         thread: Option<JoinHandle<()>>,
         next: AtomicU64,
+        rate: u32,
     }
 
     /// Removes its device when dropped.
@@ -125,15 +136,16 @@ mod imp {
     impl Audio {
         pub fn start() -> io::Result<Self> {
             let (sender, receiver) = pw::channel::channel::<Command>();
-            let (started, ready) = mpsc::channel::<io::Result<()>>();
+            let (started, ready) = mpsc::channel::<io::Result<u32>>();
             let thread = std::thread::Builder::new()
                 .name("pipewire".into())
                 .spawn(move || run(receiver, &started))?;
             match ready.recv() {
-                Ok(Ok(())) => Ok(Audio {
+                Ok(Ok(rate)) => Ok(Audio {
                     sender,
                     thread: Some(thread),
                     next: AtomicU64::new(1),
+                    rate,
                 }),
                 Ok(Err(failure)) => {
                     let _ = thread.join();
@@ -141,6 +153,10 @@ mod imp {
                 }
                 Err(_) => Err(error("its thread ended")),
             }
+        }
+
+        pub fn rate(&self) -> u32 {
+            self.rate
         }
 
         pub fn add(&self, spec: &DeviceSpec, buffer: Arc<FrameBuffer>) -> io::Result<Remover> {
@@ -180,22 +196,56 @@ mod imp {
         _listener: pw::stream::StreamListener<()>,
     }
 
-    fn run(receiver: pw::channel::Receiver<Command>, started: &mpsc::Sender<io::Result<()>>) {
+    /// The rate when PipeWire names none.
+    const RATE: u32 = 48_000;
+
+    /// The graph's default rate, from the core's properties, which come
+    /// in its info event: waited for with a round trip.
+    fn graph_rate(
+        mainloop: &pw::main_loop::MainLoopRc,
+        core: &pw::core::CoreRc,
+    ) -> io::Result<u32> {
+        let rate = std::rc::Rc::new(std::cell::Cell::new(None));
+        let pending = core.sync(0).map_err(error)?;
+        let seen = rate.clone();
+        let done = mainloop.clone();
+        let _listener = core
+            .add_listener_local()
+            .info(move |info| {
+                if let Some(value) = info
+                    .props()
+                    .and_then(|props| props.get("default.clock.rate"))
+                {
+                    seen.set(value.trim().parse::<u32>().ok().filter(|rate| *rate > 0));
+                }
+            })
+            .done(move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq == pending {
+                    done.quit();
+                }
+            })
+            .register();
+        mainloop.run();
+        Ok(rate.get().unwrap_or(RATE))
+    }
+
+    fn run(receiver: pw::channel::Receiver<Command>, started: &mpsc::Sender<io::Result<u32>>) {
         pw::init();
         let made = (|| {
             let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(error)?;
             let context = pw::context::ContextRc::new(&mainloop, None).map_err(error)?;
             let core = context.connect_rc(None).map_err(error)?;
-            Ok::<_, io::Error>((mainloop, context, core))
+            let rate = graph_rate(&mainloop, &core)?;
+            Ok::<_, io::Error>((mainloop, context, core, rate))
         })();
-        let (mainloop, _context, core) = match made {
+        let (mainloop, _context, core, rate) = match made {
             Ok(made) => made,
             Err(failure) => {
                 let _ = started.send(Err(failure));
                 return;
             }
         };
-        let _ = started.send(Ok(()));
+        let _ = started.send(Ok(rate));
         let devices: std::rc::Rc<std::cell::RefCell<HashMap<u64, Device>>> = Default::default();
         let quit = mainloop.clone();
         let owned = devices.clone();
@@ -280,6 +330,9 @@ mod imp {
                 *pw::keys::NODE_NAME => spec.name.as_str(),
                 *pw::keys::NODE_DESCRIPTION => spec.description.as_str(),
                 "node.virtual" => "true",
+                // Its audio goes over the network, PipeWire's
+                // PW_KEY_NODE_NETWORK.
+                "node.network" => "true",
             },
         )
         .map_err(error)?;
@@ -388,6 +441,10 @@ mod imp {
             ))
         }
 
+        pub fn rate(&self) -> u32 {
+            48_000
+        }
+
         pub fn add(&self, _: &DeviceSpec, _: Arc<FrameBuffer>) -> io::Result<Remover> {
             Ok(Remover)
         }
@@ -414,6 +471,7 @@ mod tests {
     #[ignore = "needs PipeWire, pw-play and pw-record"]
     fn apps_play_into_and_record_from_virtual_devices() {
         let audio = VirtualAudio::start().expect("PipeWire runs");
+        assert!(audio.rate() >= 8_000, "graph rate {}", audio.rate());
         let spec = |name: &str, playback| DeviceSpec {
             name: name.into(),
             description: name.into(),

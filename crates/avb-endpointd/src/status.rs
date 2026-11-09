@@ -97,6 +97,47 @@ pub enum Setup {
     Other,
 }
 
+impl Setup {
+    /// What it keeps a stream from.
+    pub fn blocks(self) -> Blocked {
+        match self {
+            Setup::Link => Blocked::Link,
+            Setup::NoLink => Blocked::NoLink,
+            Setup::Gptpd => Blocked::Gptpd,
+            Setup::NoGptpd => Blocked::NoGptpd,
+            Setup::Refused => Blocked::Refused,
+            Setup::Other => Blocked::Other,
+        }
+    }
+}
+
+/// Why a stream is not sending or listening, where the daemon knows of
+/// something in the way: not a stream merely waiting for a listener or
+/// a binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Blocked {
+    /// A link unit runs, which takes the link down for a moment.
+    Link,
+    /// The link is down.
+    NoLink,
+    /// gptpd is starting, and does not answer yet.
+    Gptpd,
+    /// No gptpd answers, and it is not installed.
+    NoGptpd,
+    /// gptpd will not start on the interface: another PTP daemon holds it.
+    Refused,
+    /// The interface has no PTP hardware clock: its streams' presentation
+    /// times mean nothing.
+    NoClock,
+    /// Its own virtual audio device could not be made, as where PipeWire
+    /// does not run.
+    NoDevice,
+    /// What a later daemon says, which this app does not know.
+    #[serde(other)]
+    Other,
+}
+
 /// This computer's clock as gptpd runs it on the interface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockStatus {
@@ -138,6 +179,22 @@ pub struct EndpointStatus {
     /// As text, `0x` and sixteen hex digits.
     pub entity_id: String,
     pub name: String,
+    /// It is the default entity, this computer on the network for any
+    /// app: apps find its devices by it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// Another program on this computer advertises its entity ID, such as
+    /// an older plaa running its own entity: it waits, off the network,
+    /// until that one departs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+    /// The model its file names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// It shows the generic model, as its own was not found or could not
+    /// be used, or it names none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generic_model: bool,
     /// What it is doing: streaming, waiting, listening, bound or unbound.
     pub state: String,
     /// Its streams, in order.
@@ -159,6 +216,9 @@ pub struct StreamStatus {
     pub audio: String,
     /// What it is doing: streaming, waiting, listening, bound or unbound.
     pub state: String,
+    /// What keeps it from streaming or listening, where something does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<Blocked>,
 }
 
 /// The daemon's exit statuses that are not crashes, which its unit does
@@ -330,8 +390,20 @@ mod tests {
             endpoints: vec![EndpointStatus {
                 entity_id: "0xa010a3ff00a51726".into(),
                 name: "Host entity 1".into(),
+                default: true,
+                held: true,
+                model: Some("avb-endpointd".into()),
+                generic_model: true,
                 state: "waiting".into(),
-                streams: Vec::new(),
+                streams: vec![StreamStatus {
+                    direction: Direction::Out,
+                    clock: false,
+                    name: "Out 1".into(),
+                    channels: 8,
+                    audio: "virtual".into(),
+                    state: "waiting".into(),
+                    blocked: Some(Blocked::NoDevice),
+                }],
             }],
         };
         let text = toml::to_string(&status).unwrap();
@@ -349,6 +421,33 @@ mod tests {
         let earlier: DaemonStatus =
             toml::from_str(&text.replace("\"gptpd\"", "\"ptp4l\"")).unwrap();
         assert_eq!(earlier.setup, Some(Setup::Other));
+        // So is a block a later daemon names.
+        assert!(text.contains("blocked = \"no-device\""), "{text}");
+        let later: DaemonStatus =
+            toml::from_str(&text.replace("\"no-device\"", "\"later-block\"")).unwrap();
+        assert_eq!(later.endpoints[0].streams[0].blocked, Some(Blocked::Other));
+        // A status from before the default entity and models has neither.
+        let old = text
+            .lines()
+            .filter(|line| {
+                ["default", "held", "model", "generic_model", "blocked"]
+                    .iter()
+                    .all(|key| !line.starts_with(key))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old: DaemonStatus = toml::from_str(&old).unwrap();
+        let entity = &old.endpoints[0];
+        assert_eq!(
+            (
+                &entity.model,
+                entity.default,
+                entity.held,
+                entity.generic_model
+            ),
+            (&None, false, false, false)
+        );
+        assert_eq!(old.endpoints[0].streams[0].blocked, None);
         // A status from before gptpd lacks this computer's PTP Instance.
         let old = text
             .lines()

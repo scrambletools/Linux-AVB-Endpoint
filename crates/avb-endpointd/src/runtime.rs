@@ -43,23 +43,58 @@ use crate::config::{
 use crate::gptp;
 use crate::lite::{self, Declared};
 use crate::meters::{self, Meters, StreamMeter};
+use crate::model::Identity;
 use crate::port::{Port, VLAN};
 use crate::profile;
 use crate::sharing::{self, Server, Sharers};
 use crate::signal;
 use crate::status::{
-    ClockStatus, DaemonStatus, EndpointStatus, Setup, SharerStatus, StreamStatus, status_path,
+    Blocked, ClockStatus, DaemonStatus, EndpointStatus, Setup, SharerStatus, StreamStatus,
+    status_path,
 };
+use crate::watch::{self, Watch};
 use crate::{DEVICE_MODELS, entity_id};
 
 /// The revision of every device's model, in its hash.
-const MODEL_REVISION: u8 = 7;
-/// The logo controllers show this computer's entities with: triib's app
-/// icon, at 128 pixels.
-pub const LOGO: &[u8] = include_bytes!("../data/triib.png");
-/// Their vendor's logo: Scramble Tools' square white logo on a black
-/// circle, at 128 pixels.
+const MODEL_REVISION: u8 = 8;
+/// The generic model's vendor logo, for an entity whose own model is not
+/// found: Scramble Tools' square white logo on a black circle, at 128
+/// pixels, as the entity model IDs are in Scramble Tools' block.
 pub const VENDOR_LOGO: &[u8] = include_bytes!("../data/scramble-vendor.png");
+
+/// The identity of an entity that names no model, or whose model is not
+/// found or cannot be used.
+fn generic_identity() -> Identity {
+    Identity {
+        vendor_name: "Scramble Tools".into(),
+        model_name: "avb-endpointd entity".into(),
+        firmware_version: env!("CARGO_PKG_VERSION").into(),
+        logo: None,
+        vendor_logo: Some(VENDOR_LOGO.to_vec()),
+    }
+}
+
+/// The identity an entity shows, and whether it is the generic one: its
+/// model's, with the daemon's version where the model gives none.
+fn identity_of(entity: &str, model: Option<&str>) -> (Identity, bool) {
+    let Some(model) = model else {
+        return (generic_identity(), true);
+    };
+    match Identity::find(model) {
+        Ok(mut identity) => {
+            if identity.firmware_version.is_empty() {
+                identity.firmware_version = env!("CARGO_PKG_VERSION").into();
+            }
+            (identity, false)
+        }
+        Err(error) => {
+            log(format!(
+                "{entity}: model {model}: {error}; it shows the generic model"
+            ));
+            (generic_identity(), true)
+        }
+    }
+}
 /// Class A's priority; its VLAN is the port's.
 const PRIORITY: u8 = 3;
 /// Class B's priority.
@@ -184,6 +219,8 @@ enum Input {
     SharerOpened(u64, sharing::Writer),
     SharerAsked(u64, Request),
     SharerClosed(u64),
+    /// The configuration file was written, replaced, made or removed.
+    ConfigTouched,
 }
 
 /// Milan's media clock stream format: CRF, an audio sample clock at
@@ -339,6 +376,8 @@ struct InputState {
 struct Endpoint {
     config: EndpointConfig,
     entity: Entity,
+    /// It shows the generic model.
+    generic_model: bool,
     /// Its streams as configured, and where each output's and input's is
     /// among them.
     streams: Vec<StreamConfig>,
@@ -359,10 +398,23 @@ struct Endpoint {
     clock_unlocks: u32,
 }
 
-/// A device's entity model, one for its streams' every static detail, as
-/// controllers keep a model's descriptors by its ID: FNV-1a of each
-/// stream's way, channels and formats, in the low 24 bits.
-fn model_id(outputs: &[StreamModel], inputs: &[StreamModel]) -> EntityModelId {
+/// The PipeWire node name of an entity's stream output or input `index`,
+/// counted from 0 among those of its way: `avb-<entity ID>-out-<n>` or
+/// `-in-<n>`, numbered from 1. It never changes, so WirePlumber puts an
+/// app's stream back on its device after the daemon or PipeWire restarts,
+/// and apps find the device by it.
+fn node_name(entity: u64, input: bool, index: usize) -> String {
+    let way = if input { "in" } else { "out" };
+    format!("avb-{entity:016x}-{way}-{}", index + 1)
+}
+
+/// A device's entity model, one for its model's and its streams' every
+/// static detail, as controllers keep a model's descriptors by its ID:
+/// FNV-1a of the model's names and logos and of each stream's way,
+/// channels and formats, in the low 24 bits. The firmware version stays
+/// out, as controllers read it again at each enumeration, so a new
+/// version of an app takes no new model.
+fn model_id(identity: &Identity, outputs: &[StreamModel], inputs: &[StreamModel]) -> EntityModelId {
     let mut hash: u32 = 0x811c_9dc5;
     let mut take = |bytes: &[u8]| {
         for byte in bytes {
@@ -374,9 +426,19 @@ fn model_id(outputs: &[StreamModel], inputs: &[StreamModel]) -> EntityModelId {
     // "triib entity" and media clock inputs are clock sources, 3 since
     // every input is, 4 since inputs' mappings are dynamic, 5 since
     // streams' classes follow their formats, 6 since it has a logo, 7
-    // since its vendor has one too. A class B output's formats come in
-    // another order.
+    // since its vendor has one too, 8 since its names and logos come from
+    // its model. A class B output's formats come in another order.
     take(&[MODEL_REVISION]);
+    // Each with its length, so no two models' fields run together alike.
+    for field in [
+        identity.vendor_name.as_bytes(),
+        identity.model_name.as_bytes(),
+        identity.logo.as_deref().unwrap_or_default(),
+        identity.vendor_logo.as_deref().unwrap_or_default(),
+    ] {
+        take(&(field.len() as u32).to_be_bytes());
+        take(field);
+    }
     for (way, streams) in [(0u8, outputs), (1, inputs)] {
         for stream in streams {
             take(&[way]);
@@ -433,8 +495,22 @@ impl Endpoint {
         ));
     }
 
+    /// The entity `config` lists, with its model's identity.
     fn new(
         config: EndpointConfig,
+        instance: u8,
+        mac: MacAddress,
+        interface: &str,
+        clock: ClockIdentity,
+    ) -> Self {
+        let (identity, generic) = identity_of(&config.name, config.model.as_deref());
+        Self::with_identity(config, identity, generic, instance, mac, interface, clock)
+    }
+
+    fn with_identity(
+        config: EndpointConfig,
+        identity: Identity,
+        generic_model: bool,
         instance: u8,
         mac: MacAddress,
         interface: &str,
@@ -578,12 +654,12 @@ impl Endpoint {
         }
         let model = EndpointModel {
             entity_id: entity_id(mac, instance),
-            entity_model_id: model_id(&outputs, &inputs),
+            entity_model_id: model_id(&identity, &outputs, &inputs),
             entity_name: config.name.clone(),
             group_name: String::new(),
-            vendor_name: "Scramble Tools".into(),
-            model_name: "triib entity".into(),
-            firmware_version: env!("CARGO_PKG_VERSION").into(),
+            vendor_name: identity.vendor_name,
+            model_name: identity.model_name,
+            firmware_version: identity.firmware_version,
             serial_number: String::new(),
             mac,
             interface_name: interface.into(),
@@ -596,8 +672,8 @@ impl Endpoint {
             inputs,
             clock_source,
             clock_source_inputs,
-            logo: Some(LOGO.to_vec()),
-            vendor_logo: Some(VENDOR_LOGO.to_vec()),
+            logo: identity.logo,
+            vendor_logo: identity.vendor_logo,
         };
         // A talker's streams have no destination until MAAP gives them
         // one.
@@ -607,6 +683,7 @@ impl Endpoint {
         Endpoint {
             config,
             entity: Entity::new(model, &addressed),
+            generic_model,
             outputs: out_streams.iter().map(|_| OutputState::default()).collect(),
             inputs: in_streams.iter().map(|_| InputState::default()).collect(),
             streams,
@@ -664,8 +741,8 @@ impl Endpoint {
         }
     }
 
-    /// The virtual devices its streams use, made anew for the entity's
-    /// sampling rate now; none where `audio` cannot make them.
+    /// The virtual devices its streams use, made anew; none where `audio`
+    /// cannot make them.
     fn make_devices(&mut self, audio: Option<&VirtualAudio>) {
         for state in &mut self.outputs {
             state.device = None;
@@ -677,23 +754,22 @@ impl Endpoint {
     }
 
     /// The virtual devices its streams that have none use, as those
-    /// added while the others go on with theirs.
+    /// added while the others go on with theirs. Each runs at PipeWire's
+    /// graph rate, whatever the entity's: its stream converts, so a
+    /// controller changing the entity's rate leaves apps playing into it
+    /// or recording from it connected.
     fn make_missing_devices(&mut self, audio: Option<&VirtualAudio>) {
         let Some(audio) = audio else {
             return;
         };
         let model = self.entity.model();
-        let rate = model.current_sampling_rate;
+        let rate = audio.rate();
         let entity = model.entity_id.0;
         let name = |input: bool, index: usize| {
             let streams = if input { &model.inputs } else { &model.outputs };
             let stream = &streams[index];
             (
-                format!(
-                    "avb-{entity:016x}-{}-{}",
-                    if input { "in" } else { "out" },
-                    index + 1
-                ),
+                node_name(entity, input, index),
                 format!("{} {}", model.entity_name, stream.name),
                 stream.channels,
             )
@@ -876,6 +952,15 @@ pub struct Runtime {
     path: Option<PathBuf>,
     modified: Option<SystemTime>,
     last_look: Clock,
+    /// The watch on the file's folder, and whether it heard the file
+    /// change since the daemon last read it.
+    _watch: Option<Watch>,
+    touched: bool,
+    /// The entities held off the network, by entity ID, as another program
+    /// on this computer advertises the same ID, and until when, unless
+    /// heard again: an older plaa running its own entity at the default's
+    /// instance.
+    held: HashMap<EntityId, Duration>,
     /// Whether an app asked for the meters when the daemon last looked,
     /// when that was, when it last wrote them and how many times, and each
     /// running stream's peaks in that write.
@@ -1092,6 +1177,9 @@ impl Runtime {
             |source, _, bytes| Input::Ptp(source, bytes),
         )?;
         gptp::watch(interface.clone(), stop.clone(), sender.clone(), Input::Gptp);
+        let config_watch = path
+            .as_ref()
+            .and_then(|path| watch::watch(path, sender.clone(), || Input::ConfigTouched));
         let sharing = Server::start(
             &interface,
             sender.clone(),
@@ -1209,6 +1297,9 @@ impl Runtime {
             path,
             config,
             last_look: Clock::now(),
+            _watch: config_watch,
+            touched: false,
+            held: HashMap::new(),
             meters_wanted: false,
             meters_looked: Clock::now(),
             meters_written: Clock::now(),
@@ -1257,25 +1348,29 @@ impl Runtime {
             self.turn();
             self.update_runs();
             self.write_meters();
-            if self.last_look.elapsed() >= Duration::from_secs(2) {
+            let look = self.last_look.elapsed() >= Duration::from_secs(2);
+            if look {
                 self.last_look = Clock::now();
                 self.write_status();
                 self.retry_link();
-                if let Some(config) = self.changed_config() {
-                    let file = self.file_name();
-                    if config.endpoints.is_empty() {
-                        log(format!("{file} lists no entities now, stopping"));
-                        self.shut_down();
-                        self.remove_status();
-                        return Ok(Exit::Stop);
-                    }
-                    if self.apply(&config) {
-                        log(format!("{file} changed, applied"));
-                    } else {
-                        log(format!("{file} changed, starting again"));
-                        self.shut_down();
-                        return Ok(Exit::Reload(config));
-                    }
+                self.release_held();
+            }
+            if (look || self.touched)
+                && let Some(config) = self.changed_config()
+            {
+                let file = self.file_name();
+                if config.endpoints.is_empty() {
+                    log(format!("{file} lists no entities now, stopping"));
+                    self.shut_down();
+                    self.remove_status();
+                    return Ok(Exit::Stop);
+                }
+                if self.apply(&config) {
+                    log(format!("{file} changed, applied"));
+                } else {
+                    log(format!("{file} changed, starting again"));
+                    self.shut_down();
+                    return Ok(Exit::Reload(config));
                 }
             }
         }
@@ -1345,11 +1440,13 @@ impl Runtime {
                     .then_some(place)
             })
             .collect();
+        let held = &self.held;
         let started: Vec<Endpoint> = config
             .endpoints
             .iter()
             .enumerate()
             .filter(|(place, _)| !goes_on.contains(&Some(*place)))
+            .filter(|(place, _)| !held.contains_key(&entity_id(mac, instances[*place])))
             .map(|(place, entry)| {
                 let mut made = Endpoint::new(
                     entry.clone(),
@@ -1477,6 +1574,88 @@ impl Runtime {
         true
     }
 
+    /// ADP from this computer's address that this daemon did not send, as
+    /// the socket never brings its own frames back: another program
+    /// advertising an entity here. One with the ID of an entity of the
+    /// daemon's holds that entity off the network until it departs or its
+    /// advertisement runs out, as two entities with one ID would confuse
+    /// every controller.
+    fn adp_from_here(&mut self, bytes: &[u8]) {
+        if bytes.first() != Some(&atdecc::avtp::subtype::ADP) {
+            return;
+        }
+        let Ok(adpdu) = atdecc::adp::Adpdu::decode(bytes) else {
+            return;
+        };
+        let id = adpdu.entity_id;
+        let ours = self
+            .config
+            .endpoints
+            .iter()
+            .enumerate()
+            .any(|(place, entry)| entity_id(self.mac, entry.instance_at(place)) == id);
+        if !ours {
+            return;
+        }
+        let since = self.elapsed();
+        match adpdu.message_type {
+            atdecc::adp::AdpMessageType::ENTITY_AVAILABLE => {
+                let valid = Duration::from_secs(u64::from(adpdu.valid_seconds().max(2)));
+                if self.held.insert(id, since + valid).is_none()
+                    && let Some(index) = self
+                        .endpoints
+                        .iter()
+                        .position(|endpoint| endpoint.entity.entity_id() == id)
+                {
+                    self.hold_endpoint(index);
+                }
+            }
+            atdecc::adp::AdpMessageType::ENTITY_DEPARTING => {
+                if let Some(until) = self.held.get_mut(&id) {
+                    *until = since;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes one endpoint off the network while another program advertises
+    /// its entity ID: its streams withdrawn, its threads and devices
+    /// ended, without a departure, which would take the other program's
+    /// entity from controllers too.
+    fn hold_endpoint(&mut self, index: usize) {
+        for out in self.outs().into_iter().filter(|out| out.0 == index) {
+            self.output_mut(out).talker = None;
+            self.withdraw_talker(out);
+        }
+        for input in self.ins().into_iter().filter(|input| input.0 == index) {
+            self.stop_listener(input);
+        }
+        let endpoint = self.endpoints.remove(index);
+        log(format!(
+            "{}: another program here advertises {} as its own entity, such as an older plaa; \
+             off the network until it departs",
+            endpoint.config.name,
+            endpoint.entity.entity_id()
+        ));
+    }
+
+    /// Starts the entities held off the network whose other program
+    /// departed, or was not heard for as long as it said its advertisement
+    /// stays valid.
+    fn release_held(&mut self) {
+        let since = self.elapsed();
+        let before = self.held.len();
+        self.held.retain(|_, until| *until > since);
+        if self.held.len() < before {
+            log("another program's entity left; starting ours again");
+            let config = self.config.clone();
+            if !self.apply(&config) {
+                log("could not start it in place; it starts with the next change");
+            }
+        }
+    }
+
     /// Stops one endpoint while the others go on: its streams'
     /// declarations withdrawn, its threads and virtual audio devices
     /// ended, and its departure said.
@@ -1559,16 +1738,37 @@ impl Runtime {
         }
     }
 
-    /// The configuration file, when it changed into something else.
+    /// The configuration file, when it changed into something else: read
+    /// where the watch heard it written, or its modification time moved.
     fn changed_config(&mut self) -> Option<Config> {
         let now = modified(self.path.as_ref());
-        if now == self.modified {
+        if now == self.modified && !std::mem::take(&mut self.touched) {
             return None;
         }
+        self.touched = false;
         self.modified = now;
-        match crate::store::load::<Config>(self.path.as_ref()?) {
-            Ok(config) if config != self.config => Some(config),
-            Ok(_) => None,
+        let path = self.path.clone()?;
+        match crate::store::load::<Config>(&path) {
+            Ok(mut config) => {
+                // The default entity, removed by hand, made again from its
+                // default values.
+                if config.default_entity().is_none() {
+                    let name = crate::config::computer_name();
+                    match crate::config::restore_default(&path, &name) {
+                        Ok((restored, made)) => {
+                            if made {
+                                log(format!(
+                                    "{}: the default entity was removed; made again as it first was",
+                                    self.file_name()
+                                ));
+                            }
+                            config = restored;
+                        }
+                        Err(error) => log(format!("{}: {error}", self.file_name())),
+                    }
+                }
+                (config != self.config).then_some(config)
+            }
             Err(error) => {
                 log(format!("{}: {error}", self.file_name()));
                 None
@@ -1630,62 +1830,44 @@ impl Runtime {
         if !keep(entry) {
             return;
         }
-        let Some(path) = self.path.clone() else {
+        // Into what the file holds now, by the entity's instance, so an
+        // app's change since the daemon read it stays; the daemon reads
+        // that change as it reads any.
+        self.write_back(|now| {
+            if let Some(entry) = now.entity_mut(instance) {
+                keep(entry);
+            }
+        });
+    }
+
+    /// Changes the configuration file under its edit lock, as an app
+    /// does, into what the file holds then.
+    fn write_back(&self, change: impl FnOnce(&mut Config)) {
+        let Some(path) = &self.path else {
             return;
         };
-        if modified(Some(&path)) != self.modified {
-            // The file changed since it was read, as when the app wrote
-            // it: the change goes into what it holds now, which the
-            // daemon then reads again, rather than over it.
-            let Ok(mut now) = crate::store::load::<Config>(&path) else {
-                return;
-            };
-            let found = now
-                .endpoints
-                .iter()
-                .enumerate()
-                .position(|(place, entry)| entry.instance_at(place) == instance);
-            if let Some(found) = found
-                && keep(&mut now.endpoints[found])
-                && let Err(error) = crate::store::save(&path, &now)
-            {
-                log(format!("{}: {error}", self.file_name()));
-            }
-            return;
-        }
-        if let Err(error) = crate::store::save(&path, &self.config) {
+        if let Err(error) = crate::config::edit_at(path, change) {
             log(format!("{}: {error}", self.file_name()));
         }
-        self.modified = modified(Some(&path));
     }
 
     /// Keeps a setting of the whole configuration that a controller gave
     /// in the configuration file.
     fn keep_config(&mut self) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        if modified(Some(&path)) != self.modified {
-            // As in keep_settings: into what the file holds now.
-            let Ok(mut now) = crate::store::load::<Config>(&path) else {
-                return;
-            };
-            now.multicast_escalation = self.config.multicast_escalation;
-            if let Err(error) = crate::store::save(&path, &now) {
-                log(format!("{}: {error}", self.file_name()));
-            }
-            return;
-        }
-        if let Err(error) = crate::store::save(&path, &self.config) {
-            log(format!("{}: {error}", self.file_name()));
-        }
-        self.modified = modified(Some(&path));
+        let escalation = self.config.multicast_escalation;
+        self.write_back(|now| now.multicast_escalation = escalation);
     }
 
     fn write_status(&self) {
         let Some(path) = status_path(&self.interface) else {
             return;
         };
+        // What keeps every stream of every entity from running, where
+        // something does.
+        let setup = self.setup();
+        let blocked = setup
+            .map(Setup::blocks)
+            .or((!self.hardware_clock).then_some(Blocked::NoClock));
         let endpoints = self
             .endpoints
             .iter()
@@ -1700,7 +1882,11 @@ impl Runtime {
                 EndpointStatus {
                     entity_id: endpoint.entity.entity_id().to_string(),
                     name: endpoint.entity.model().entity_name.clone(),
-                    streams: stream_statuses(endpoint),
+                    default: endpoint.config.is_default,
+                    held: false,
+                    model: endpoint.config.model.clone(),
+                    generic_model: endpoint.generic_model,
+                    streams: stream_statuses(endpoint, blocked),
                     state: if streaming {
                         "streaming"
                     } else if listening {
@@ -1715,6 +1901,7 @@ impl Runtime {
                     .into(),
                 }
             })
+            .chain(self.held_statuses())
             .collect();
         let status = DaemonStatus {
             pid: std::process::id(),
@@ -1732,11 +1919,33 @@ impl Runtime {
                 priority1: Some(status.priority1),
                 neighbor_rate_ppb: status.neighbor_rate_ppb,
             }),
-            setup: self.setup(),
+            setup,
             sharers: self.sharers.statuses(),
             endpoints,
         };
         let _ = crate::store::save(&path, &status);
+    }
+
+    /// The entities held off the network, as their file lists them.
+    fn held_statuses(&self) -> Vec<EndpointStatus> {
+        self.config
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter_map(|(place, entry)| {
+                let id = entity_id(self.mac, entry.instance_at(place));
+                self.held.contains_key(&id).then(|| EndpointStatus {
+                    entity_id: id.to_string(),
+                    name: entry.name.clone(),
+                    default: entry.is_default,
+                    held: true,
+                    model: entry.model.clone(),
+                    generic_model: false,
+                    state: "held".into(),
+                    streams: Vec::new(),
+                })
+            })
+            .collect()
     }
 
     /// What it is setting up, or misses, that the entities wait on: the
@@ -1903,6 +2112,7 @@ impl Runtime {
         let now = self.now();
         let since = self.elapsed();
         match input {
+            Input::ConfigTouched => self.touched = true,
             Input::Avtp(source, _, bytes)
                 if bytes.first() == Some(&atdecc::avtp::subtype::MAAP) =>
             {
@@ -1913,6 +2123,9 @@ impl Runtime {
             Input::Avtp(source, group, bytes) => {
                 if self.lite.is_some() && source != self.mac {
                     self.cvu_heard(source, group, &bytes);
+                }
+                if source == self.mac {
+                    self.adp_from_here(&bytes);
                 }
                 for endpoint in &mut self.endpoints {
                     endpoint.entity.handle_frame(now, source, &bytes);
@@ -3341,9 +3554,9 @@ impl Runtime {
             }
             EntityEvent::SamplingRateChanged(rate) => {
                 log(format!("{name}: sampling rate {rate}"));
-                // The virtual devices run at the entity's rate: made
-                // anew, and the streams on them start again.
-                self.endpoints[index].make_devices(self.audio.as_ref());
+                // The streams start again at the new rate, converting to
+                // and from their virtual devices, which stay at the
+                // graph's rate with the apps on them connected.
                 for at in 0..self.endpoints[index].outputs.len() as u16 {
                     if self.output_mut(Out(index, at)).talker.take().is_some() {
                         self.start_talker(Out(index, at));
@@ -4912,7 +5125,10 @@ impl Runtime {
 }
 
 /// What each of a device's streams is doing, in the configured order.
-fn stream_statuses(endpoint: &Endpoint) -> Vec<StreamStatus> {
+/// Each of an entity's streams as the status has it: what it does, and,
+/// while it does not run, what keeps it from running, `blocked` where
+/// that is the same for every stream.
+fn stream_statuses(endpoint: &Endpoint, blocked: Option<Blocked>) -> Vec<StreamStatus> {
     let model = endpoint.entity.model();
     endpoint
         .streams
@@ -4921,7 +5137,7 @@ fn stream_statuses(endpoint: &Endpoint) -> Vec<StreamStatus> {
         .map(|(place, stream)| {
             let output = endpoint.out_streams.iter().position(|at| *at == place);
             let input = endpoint.in_streams.iter().position(|at| *at == place);
-            let (name, state) = match (output, input) {
+            let (name, state, running, device) = match (output, input) {
                 (Some(at), _) => (
                     model.outputs.get(at).map(|stream| stream.name.clone()),
                     if endpoint.outputs[at].talker.is_some() {
@@ -4929,6 +5145,8 @@ fn stream_statuses(endpoint: &Endpoint) -> Vec<StreamStatus> {
                     } else {
                         "waiting"
                     },
+                    endpoint.outputs[at].talker.is_some(),
+                    endpoint.outputs[at].device.is_some(),
                 ),
                 (_, Some(at)) => (
                     model.inputs.get(at).map(|stream| stream.name.clone()),
@@ -4939,8 +5157,17 @@ fn stream_statuses(endpoint: &Endpoint) -> Vec<StreamStatus> {
                     } else {
                         "unbound"
                     },
+                    endpoint.inputs[at].listener.is_some(),
+                    endpoint.inputs[at].device.is_some(),
                 ),
-                _ => (None, "waiting"),
+                _ => (None, "waiting", false, false),
+            };
+            let blocked = if running {
+                None
+            } else if stream.is_virtual() && !device {
+                Some(Blocked::NoDevice)
+            } else {
+                blocked
             };
             StreamStatus {
                 direction: stream.direction,
@@ -4952,6 +5179,7 @@ fn stream_statuses(endpoint: &Endpoint) -> Vec<StreamStatus> {
                     .clone()
                     .unwrap_or_else(|| crate::config::VIRTUAL.into()),
                 state: state.into(),
+                blocked,
             }
         })
         .collect()
@@ -5360,7 +5588,7 @@ mod tests {
             },
         ]);
         let model = device.entity.model();
-        assert_eq!(model.model_name, "triib entity");
+        assert_eq!(model.model_name, "avb-endpointd entity");
         let names: Vec<&str> = model
             .outputs
             .iter()
@@ -5569,6 +5797,83 @@ mod tests {
         assert!(!is_device_model(EntityModelId(0x0000_0074_6869_6e67)));
         // triib 1.0's talkers' and listeners'.
         assert!(!is_device_model(EntityModelId(0x8c1f_6436_c000_0002)));
+    }
+
+    /// The model ID follows the model's names and logos and the entity's
+    /// streams, but not the firmware version, which controllers read
+    /// again at each enumeration.
+    #[test]
+    fn a_model_id_follows_the_model_and_the_streams() {
+        let mac = MacAddress([0xf0, 0xa7, 0x31, 0xf4, 0x0f, 0x14]);
+        let made = |identity: &Identity, streams: Vec<StreamConfig>| {
+            let config = EndpointConfig {
+                streams,
+                ..EndpointConfig::new("Studio", Some(4))
+            };
+            Endpoint::with_identity(
+                config,
+                identity.clone(),
+                false,
+                4,
+                mac,
+                "enp2s0",
+                ClockIdentity(1),
+            )
+            .entity
+            .model()
+            .entity_model_id
+        };
+        let two = || vec![stream(Direction::Out, 2), stream(Direction::In, 2)];
+        let plaa = Identity {
+            vendor_name: "Scramble Tools".into(),
+            model_name: "plaa".into(),
+            firmware_version: "0.6.0".into(),
+            logo: Some(b"\x89PNG plaa".to_vec()),
+            vendor_logo: None,
+        };
+        let id = made(&plaa, two());
+        assert!(is_device_model(id));
+        let triib = Identity {
+            model_name: "triib".into(),
+            ..plaa.clone()
+        };
+        assert_ne!(id, made(&triib, two()));
+        let no_logo = Identity {
+            logo: None,
+            ..plaa.clone()
+        };
+        assert_ne!(id, made(&no_logo, two()));
+        let more = vec![stream(Direction::Out, 2), stream(Direction::In, 4)];
+        assert_ne!(id, made(&plaa, more));
+        let newer = Identity {
+            firmware_version: "0.7.0".into(),
+            ..plaa.clone()
+        };
+        assert_eq!(id, made(&newer, two()));
+    }
+
+    /// An entity naming no model, or one that is not found, shows the
+    /// generic model with the daemon's version, and says so.
+    #[test]
+    fn a_missing_model_shows_the_generic_one() {
+        assert_eq!(identity_of("Studio", None), (generic_identity(), true));
+        let (identity, generic) = identity_of("Studio", Some("no-such-model-anywhere"));
+        assert!(generic);
+        assert_eq!(identity, generic_identity());
+        assert_eq!(identity.firmware_version, env!("CARGO_PKG_VERSION"));
+        let device = endpoint(vec![stream(Direction::Out, 2)]);
+        assert!(device.generic_model);
+        assert_eq!(device.entity.model().model_name, "avb-endpointd entity");
+        assert_eq!(device.entity.model().logo, None);
+    }
+
+    /// A stream's device is named for its entity, its way and its place
+    /// among that way's streams, from 1, as apps look it up.
+    #[test]
+    fn device_names_stay_put() {
+        let entity = 0xf0a7_31ff_70f4_0f14;
+        assert_eq!(node_name(entity, false, 0), "avb-f0a731ff70f40f14-out-1");
+        assert_eq!(node_name(entity, true, 1), "avb-f0a731ff70f40f14-in-2");
     }
 
     /// A stream of 1.0's talker, read as a device's, keeps its name, its

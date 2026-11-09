@@ -38,12 +38,7 @@ pub struct Link {
 
 /// Whether `interface` names a unit as it is: what Linux allows in an
 /// interface name, less what a unit name would need escaped.
-pub fn nameable(interface: &str) -> bool {
-    !interface.is_empty()
-        && interface
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-}
+pub use crate::unit::nameable;
 
 fn active(unit: &str) -> bool {
     Command::new("systemctl")

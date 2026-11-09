@@ -4,9 +4,10 @@
 //! and to a PipeWire device apps play into or record from.
 //!
 //! Without features the crate is what apps share with the daemon, on
-//! every platform: the entities to run ([`config`]), what the daemon is
-//! doing ([`status`]), how loud its streams are ([`meters`]), where those
-//! files are ([`store`]), and how an entity's ID is made
+//! every platform: the entities to run ([`config`]) and the models they
+//! show ([`model`]), what the daemon is doing ([`status`]), how loud its
+//! streams are ([`meters`]), where those files are ([`store`]), the
+//! daemon's user unit ([`unit`]), and how an entity's ID is made
 //! ([`entity_id`]). The `daemon` feature adds the daemon, for Linux.
 
 use atdecc::EntityId;
@@ -14,8 +15,10 @@ use avb_net::MacAddress;
 
 pub mod config;
 pub mod meters;
+pub mod model;
 pub mod status;
 pub mod store;
+pub mod unit;
 
 #[cfg(feature = "daemon")]
 pub mod gptp;
@@ -31,6 +34,8 @@ pub mod runtime;
 pub mod sharing;
 #[cfg(feature = "daemon")]
 pub mod signal;
+#[cfg(feature = "daemon")]
+mod watch;
 
 /// The entity models of the daemon's entities, under Scramble Tools' MA-S
 /// `8C-1F-64-36-C`: this, and a hash of their streams. triib 1.0's

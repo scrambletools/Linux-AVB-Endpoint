@@ -1,0 +1,5 @@
+# The default entity's model: this computer on the network for any app.
+# The package writes its version in as the firmware version.
+vendor_name = "Scramble Tools"
+model_name = "avb-endpointd"
+vendor_logo = "scramble-vendor.png"

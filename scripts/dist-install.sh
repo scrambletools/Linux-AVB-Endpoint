@@ -34,6 +34,17 @@ for unit in avb-link@.service avb-link-reset@.service; do
 done
 install -D -m 0644 "$units/50-avb-link.rules" \
     "$root/usr/share/polkit-1/rules.d/50-avb-link.rules"
+# The default entity's model, with the package's version as its firmware
+# version, and its vendor's logo.
+models="$root/usr/share/avb-endpointd/models"
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$here/crates/avb-endpointd/Cargo.toml" | head -n 1)
+install -d "$models"
+{
+    cat "$here/packaging/linux/models/avb-endpointd.toml"
+    echo "firmware_version = \"$version\""
+} >"$models/avb-endpointd.toml"
+chmod 0644 "$models/avb-endpointd.toml"
+install -m 0644 "$here/packaging/linux/models/scramble-vendor.png" "$models/scramble-vendor.png"
 install -D -m 0644 "$here/docs/endpointd.md" "$root/usr/share/doc/avb-endpointd/endpointd.md"
 install -D -m 0644 "$here/LICENSE-MIT" "$root/usr/share/licenses/avb-endpointd/LICENSE-MIT"
 install -D -m 0644 "$here/LICENSE-APACHE" "$root/usr/share/licenses/avb-endpointd/LICENSE-APACHE"

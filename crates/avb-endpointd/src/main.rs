@@ -6,9 +6,10 @@
 //! It takes gPTP from gptpd, which it starts on the interface where none
 //! runs, and its raw sockets from avb-netraw, which holds `CAP_NET_RAW` in
 //! its place. The entities are listed in `<interface>.toml` in the
-//! configuration folder, or the file `--config` names. With no file it
-//! takes triib's entities for the interface, where triib listed any, and
-//! with no entities it has nothing to do and ends.
+//! configuration folder, or the file `--config` names, which it watches
+//! for the apps' changes. With no file it takes triib's entities for the
+//! interface, where triib listed any, and with no entities it has nothing
+//! to do and ends.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -59,8 +60,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let mut config = match first_config(&interface, &path) {
-        Ok(Some(config)) => config,
-        Ok(None) => {
+        Ok(config) if !config.endpoints.is_empty() => config,
+        Ok(_) => {
             println!("no entities listed for {interface}");
             return ExitCode::SUCCESS;
         }
@@ -121,25 +122,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// The entities to start with: the file's, or with no file triib's for
-/// the interface, written to it; `None` when there are none.
-fn first_config(interface: &str, path: &Path) -> Result<Option<Config>, ExitCode> {
-    match config::load(path) {
-        Ok(config) => Ok((!config.endpoints.is_empty()).then_some(config)),
-        Err(error) if error.is_missing() => {
-            let Some(config) = config::triib_entities(interface) else {
-                return Ok(None);
-            };
-            if let Err(error) = store::save(path, &config) {
-                eprintln!("{}: {error}", path.display());
-                return Err(ExitCode::FAILURE);
+/// The entities to start with: the file's, with their instances written
+/// down, or with no file triib's for the interface, written to it; with
+/// the default entity, made from its default values where the file lacks
+/// it.
+fn first_config(interface: &str, path: &Path) -> Result<Config, ExitCode> {
+    let existed = path.exists();
+    match config::first_read(path, interface, &config::computer_name()) {
+        Ok(config) => {
+            let triibs = config
+                .endpoints
+                .iter()
+                .filter(|entry| !entry.is_default)
+                .count();
+            if !existed && triibs > 0 {
+                println!(
+                    "took triib's {triibs} entities on {interface} into {}",
+                    path.display()
+                );
             }
-            println!(
-                "took triib's {} entities on {interface} into {}",
-                config.endpoints.len(),
-                path.display()
-            );
-            Ok(Some(config))
+            Ok(config)
         }
         Err(error) => {
             eprintln!("{}: {error}", path.display());
