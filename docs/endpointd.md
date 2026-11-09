@@ -1,7 +1,9 @@
 # avb-endpointd: this computer's entities, for any app
 
-Status: reviewed by triib (2026-11-08). Step 1 is on the `endpointd`
-branch here and the `avb-endpointd` branch in triib.
+Status: reviewed by triib (2026-11-08). Step 1 is in avb-endpointd
+0.1.0 and 0.1.1, on main here and in triib. Step 2 is on the
+`endpointd-2` branch here, as avb-endpointd 0.2.0 and avb-pipewire
+0.1.1.
 
 ## Why
 
@@ -60,9 +62,10 @@ the entity IDs, in its host, meter, preset and network views. So
 `avb-endpointd` is published in two halves:
 
 - **A library** that builds everywhere: the configuration file's types,
-  with load and save under the file lock, the status and meters readers,
-  the paths, and `entity_id`. triib-store's load, save and paths that
-  the daemon uses move with it.
+  with load and save under the file lock, the model files, the status
+  and meters readers, the paths, the unit's start, disable and state,
+  and `entity_id`. triib-store's load, save and paths that the daemon
+  uses move with it.
 - **The daemon**, Linux only, behind a feature.
 
 The daemon and the apps no longer ship together, so:
@@ -111,14 +114,18 @@ The daemon and the apps no longer ship together, so:
     NoNewPrivileges process doesn't today.
   - It logs to the journal instead of `endpointd.log`.
 - **Who starts it:**
-  - An app enables and starts it when it adds the interface's first
-    entity. A user unit needs no polkit. Enabled, it starts at login
-    with no app running.
-  - With no entities listed it exits 0, so an enabled unit with nothing
-    to run costs nothing.
+  - An app enables and starts it when a person puts this computer on
+    the network on an interface, or adds an entity there, with
+    `unit::start`: `reset-failed`, then `enable --now`. A user unit
+    needs no polkit. Enabled, it starts at login with no app running.
+    `unit::state` tells a refusal, a missing interface and a file that
+    doesn't parse apart by the exit status.
+  - Whenever it runs, it runs the default entity (see "The default
+    entity"), so it doesn't end by itself; `unit::disable` stops it and
+    its starting at login, taking every entity on the interface off the
+    network.
   - With no configuration file at all, it imports triib's (see
-    "Migration") or exits 0. It never invents an entity, as
-    first_config does now.
+    "Migration"), and adds the default entity.
 
 ### One interface, one person
 
@@ -169,7 +176,9 @@ It is triib's `entities.toml` with these changes:
 
 - The interface comes from the file's name. `interface` and the restart
   when it changes go.
-- Each entity names its owner and its model (below).
+- Each entity names its model (below). One is the default entity
+  (below); any app, or a person by hand, adds and removes the others,
+  which belong to no app.
 - Every entity carries an explicit `instance`. Today an entry without
   one takes its place in the list, so one app removing an entry above
   another's would change the other's entity ID. The daemon writes the
@@ -177,14 +186,16 @@ It is triib's `entities.toml` with these changes:
 
 Rules for changing it:
 
-- **Locking:** every read, change and write, by either app or the
-  daemon, holds an flock on `<interface>.toml.lock` beside the file,
-  and only for that edit. This is not the daemon's instance lock in
-  `$XDG_RUNTIME_DIR`, which it holds for its whole life. The edit lock
-  is a separate file because the write replaces the configuration
-  file's inode. Without it, an app writing a stale copy loses another
-  writer's change, and the daemon's own check-then-save in
-  keep_settings isn't atomic.
+- **Locking:** every change, by either app or the daemon, goes
+  through `config::edit`, which holds an flock on
+  `<interface>.toml.lock` beside the file from reading it to writing
+  it back, and only for that edit. It writes every instance down and
+  writes only where something changed. Reading alone takes no lock, as
+  every write replaces the file whole. This is not the daemon's
+  instance lock in `$XDG_RUNTIME_DIR`, which it holds for its whole
+  life. The edit lock is a separate file because the write replaces the
+  configuration file's inode. Without it, an app writing a stale copy
+  loses another writer's change.
 - **Writes** are by atomic rename.
 - **Change detection:** the daemon watches the folder with inotify,
   which catches writes within one timestamp tick that the mtime check
@@ -196,10 +207,16 @@ Rules for changing it:
 - **Status:** `$XDG_RUNTIME_DIR/avb-endpointd/<interface>.toml`,
   rewritten every two seconds, as triib's now:
   - the process, gptpd's state and the clock;
-  - each entity and stream;
-  - each stream's state as plaa shows it now: blocked, waiting for a
-    listener or sending, with why when blocked. Blocked covers another
-    person's daemon, no PTP clock and gptpd refused.
+  - each entity, with its model and whether it shows the generic model,
+    whether it is the default, and whether it is held off the network
+    because another program here advertises its entity ID, and each
+    stream;
+  - each stream's state as plaa shows it now: sending or waiting for a
+    listener, listening, bound or unbound, and while it doesn't run,
+    `blocked` with why: the link unit, no link, gptpd starting, no
+    gptpd, gptpd refused, no PTP hardware clock, or no virtual device.
+    Another person's daemon holding the interface shows in the unit's
+    state instead, as this person's daemon then doesn't run.
 - **Meters:** `$XDG_RUNTIME_DIR/avb-endpointd/<interface>.meters`,
   written every 50 ms while an app touches `<interface>.meters-wanted`,
   as triib's now.
@@ -218,52 +235,79 @@ Rules for changing it:
 # ~/.config/avb-endpointd/enp2s0.toml
 avb_lite = "auto"
 
-[[entity]]
+[[endpoint]]
 instance = 112            # 0x70: plaa's entity ID, kept
-owner = "plaa"
-model = "plaa"
-name = "plaa on linux-desktop"
+default = true
+model = "avb-endpointd"
+name = "linux-desktop"
 
-[[entity.stream]]
+[[endpoint.stream]]
 direction = "out"
 name = "Playback"
 channels = 2
-audio = "virtual"
 
-[[entity.stream]]
+[[endpoint.stream]]
 direction = "in"
 name = "Listen"
 channels = 2
-audio = "virtual"
 
-[[entity]]
+[[endpoint]]
 instance = 0
-owner = "triib"
 model = "triib"
 name = "Host entity 1"
 # streams as triib writes them now
 ```
 
-### Owners
+### The default entity
 
-- Each app adds, changes and removes only the entities it owns. That
-  includes restoring a preset: triib's restore replaces only triib's
-  entities, not the whole list as now.
-- The daemon's own write-back merges into the current file by instance,
-  under the lock.
-- An entity with no owner was made by hand, and both apps leave it
-  alone.
-- Each app shows every entity on its interface, so a person sees what
-  runs, and marks the ones the other app owns as that app's.
+One entity on each interface is the default, `default = true`: this
+computer on the network for any app (the user, 2026-11-09).
+
+- **Always there:** it runs whenever the daemon runs. The daemon makes
+  it from its default values where the file lacks it, as it first
+  starts, and again at once where a person removes it by hand.
+- **Its default values:** instance 0x70, plaa's entity's before it, so
+  the bindings controllers made to plaa's entity by entity ID and index
+  carry over, or the lowest free instance where another entity takes
+  0x70; named for the computer's host name; avb-endpointd's model; a
+  2-channel "Playback" output 0 any app plays into and a 2-channel
+  "Listen" input 0 any app records from, each with its virtual device,
+  `avb-<entity id>-out-1` and `-in-1`.
+- **No app removes it:** `config::edit` keeps it, whatever an app's
+  change does to the list, even replacing the whole list, as triib's
+  preset restore does. An app or a controller may rename it or change
+  its streams' settings. No app makes another entity the default.
+- **The others** belong to no app: any app, or a person by hand, adds,
+  changes and removes them. The daemon's own write-back merges into
+  the current file by instance, under the lock.
+- **One entity ID, one entity:** where another program on this computer
+  advertises the entity ID of one of the daemon's entities, as an older
+  plaa running its own entity at 0x70 does, the daemon holds that
+  entity off the network, without a departing message, until the other
+  departs or its advertisement runs out. The status marks it held.
 
 ### Models
 
-Each entity's identity in AEM comes from a model file the owning app's
-package installs, `/usr/share/avb-endpointd/models/<model>.toml`:
+Each entity's identity in AEM comes from a model file an app's
+package installs, or avb-endpointd's own for the default entity, `/usr/share/avb-endpointd/models/<model>.toml`:
 
 - the vendor and model names;
 - the firmware version, from the app's package version;
 - the logo images.
+
+```toml
+# /usr/share/avb-endpointd/models/plaa.toml
+vendor_name = "Scramble Tools"
+model_name = "plaa"
+firmware_version = "0.6.0"    # the daemon's when left out
+logo = "plaa.png"             # beside the file
+vendor_logo = "scramble-vendor.png"
+```
+
+The daemon looks in `avb-endpointd/models` under `$XDG_DATA_HOME`, then
+each of `$XDG_DATA_DIRS` (`/usr/local/share`, `/usr/share`), so a dev
+build's model can sit in `~/.local/share`. Logos are PNG files, square,
+128 pixels a side, of at most 64 KiB.
 
 A model file gives no entity model ID. The daemon makes every one as it
 makes triib's now, `DEVICE_MODELS` with a 24-bit hash whose bit 16 is
@@ -302,8 +346,9 @@ stream index. Its stream ID follows the daemon's rule. When plaa moves
 onto the daemon, it tells the ESP session that the model ID and the
 stream ID change, and the registry retires plaa's model block.
 
-A model the daemon can't find falls back to a generic one, and the
-status says so.
+A model the daemon can't find, or can't use, falls back to a generic
+one, "Scramble Tools" and "avb-endpointd entity" with the vendor logo,
+and the status says so.
 
 ### Entity IDs
 
@@ -327,7 +372,7 @@ As triib-pipewire makes them now, moved to the avb repository as
     today's `triib-` prefix. It is stable from then on, so WirePlumber
     returns an app's stream to its device after the daemon or PipeWire
     restarts.
-  - Step 2 adds `node.network = true`.
+  - From step 2 it carries `node.network = true`.
 - **Lifetime:** a device exists while its entity runs, whether or not a
   listener is connected, so an app can pick it at any time.
   - With no listener connected, what plays into a playback device is
@@ -344,7 +389,7 @@ As triib-pipewire makes them now, moved to the avb repository as
   - When a controller changes a stream's rate, the daemon restarts only
     that talker or listener, whose shared source or sink already
     converts rates. Apps playing into the device stay connected.
-  - Today a rate change drops and recreates every device.
+  - Before step 2, a rate change dropped and recreated every device.
   - The conversion interpolates cubically with no low-pass filter. That
     is fine for 48 kHz up to 96, but would alias taking a 96 kHz device
     down to a 48 kHz stream. That is one more reason to keep the devices
@@ -352,25 +397,24 @@ As triib-pipewire makes them now, moved to the avb repository as
 
 ## plaa on the daemon
 
-On Linux, "Send what plays" in plaa's Network Audio settings now does
-this:
+On Linux, plaa is a media app like any other: it has no entity of its
+own, and the default entity takes its place and its entity ID.
 
-- **The entity:** plaa adds or updates its entity in the interface's
-  file, owned by "plaa", named from `avb_name` ("plaa on <host>"), with
-  plaa's model. Its streams are a 2-channel output and a 2-channel
-  input, both virtual, offering the formats plaa offers now. Then plaa
-  starts and enables the unit.
 - **The talker's audio:** the copy of the media window, which plaa now
-  pushes into its in-process buffer, plaa plays into its entity's
-  playback device as a second output stream. Other apps can play into
-  the same device, and PipeWire mixes them.
-- **The input:** plaa records from its entity's recording device into a
-  player window, as `Listened` does now. Pausing the window unbinds the
-  input as now, through plaa's controller.
-- **Status:** plaa reads the status file for its entity's state, gptpd's
-  notes and failures. It shows them where it shows its own now.
-- **Turning it off:** plaa removes its entity. With no entities left the
-  daemon exits, and plaa disables the unit.
+  pushes into its in-process buffer, plaa plays into the default
+  entity's playback device, found by the status's default entity, as a
+  second output stream. Other apps can play into the same device, and
+  PipeWire mixes them.
+- **The input:** plaa records from the default entity's recording
+  device into a player window, as `Listened` does now.
+- **Status:** plaa reads the status file for the default entity's state,
+  gptpd's notes and failures. It shows them where it shows its own now.
+- **On and off:** plaa's Network Audio can put this computer on the
+  network, starting and enabling the unit, or take it off. Its "Send
+  what plays" going off only stops plaa playing into the device, as
+  disabling the unit would take triib's entities off the network too.
+- plaa's entity name setting (`avb_name`) goes on Linux: the default
+  entity is the computer's, renamed by a controller or in the file.
 
 What leaves plaa on Linux, as the in-process entity goes (see
 "Decided in review"):
@@ -381,16 +425,19 @@ What leaves plaa on Linux, as the in-process entity goes (see
 - plaa-link@ and the gptpd starting logic.
 
 plaa's controller stays, with its controller ID (0xfc in the instance
-octet). It finds its own entity by entity ID.
+octet), for browsing, details and binding listeners to the default
+entity, as its Play does now.
 
 On a Mac nothing changes: plaa plays into the Mac's own entity as now.
 On Windows there is no entity, as decided.
 
 ## triib on the daemon
 
-- host.rs writes the interface's file under the lock, owning its
-  entities as "triib", and starts the unit instead of spawning
-  triib-endpointd. It reads status and meters at the new paths.
+- host.rs writes the interface's file under the lock, giving its
+  entities triib's model, and starts the unit instead of spawning
+  triib-endpointd. It reads status and meters at the new paths. triib's
+  package installs triib's model file. triib shows the default entity
+  with the others, and can't remove it.
 - **What goes:**
   - triib's "entities file" setting and move_entities, since the path
     is fixed per interface;
@@ -403,10 +450,11 @@ On Windows there is no entity, as decided.
 
 - **triib's entities:** the first time a person's daemon finds no file
   for an interface, it imports `$XDG_DATA_HOME/triib/entities.toml` for
-  that interface. It marks the entities as triib's and pins their
+  that interface. It gives the entities triib's model and pins their
   instances.
-- **plaa's entity:** the first time plaa finds the daemon, it adds its
-  entity from its settings (`avb_interface`, `avb_talker`, `avb_name`).
+- **plaa's entity:** the default entity takes its entity ID, 0x70, so
+  controllers' bindings to it carry over; its model ID and stream IDs
+  change, and the ESP bench is told first.
 - **Device names:** the devices' names change from `triib-` to `avb-`,
   so WirePlumber won't return apps' streams to them the first time. An
   app that played into a triib device picks the new one again once.
@@ -459,7 +507,9 @@ The link units stay as they are.
 ## Testing
 
 - **Unit:**
-  - two owners and the daemon changing one file under the lock;
+  - apps and the daemon changing one file under the lock;
+  - the default entity kept through any edit, and made again from its
+    default values where removed by hand;
   - instances pinned on import;
   - a missing model;
   - model IDs: the same streams under two models, and an edit to the
@@ -467,7 +517,8 @@ The link units stay as they are.
   - importing triib's file;
   - stable node names.
 - **One host:**
-  - plaa and triib each own an entity on one daemon;
+  - triib's entities beside the default entity on one daemon;
+  - an older plaa's entity at 0x70 holding the default off the network;
   - pw-play or mpv plays into plaa's device, and a listener on a veth
     pair receives it;
   - two interfaces with two instances of the template;
@@ -485,6 +536,115 @@ The link units stay as they are.
   (another person's) beside the daemon, and triib before and after its
   move.
 
+## Proposal: pinned destinations and sources
+
+Not decided: for the user to decide on.
+Nothing here changes how triib's features work: triib's entities,
+devices and controller go on as they are.
+
+The aim is that a media app needs nothing AVB-specific: plaa, mpv or a
+DAW plays into a PipeWire device and records from one, as it would
+speakers and a microphone. The default entity (step 2) is this
+computer on the network, which controllers route. This adds the other
+way round: the speakers and amp inputs a person pins, each a sink of
+its own, which connect when an app plays into them, and remote talkers
+as sources. PipeWire already works that way for other networks:
+AirPlay receivers, Snapcast and ROC appear as local sinks named for the
+remote device.
+
+### Pins
+
+The interface's file lists them once, at the top level, edited under
+the lock like any change: `destination = ["<entity id>:<input>", ...]`
+for listener inputs and `source = ["<entity id>:<output>", ...]` for
+talker outputs, each index the descriptor's, counted from 0 as AEM
+counts it. A later `destinations = "all"` could list every compatible
+input, for small setups; pinned is the default, as a Milan network's
+every amp and speaker input in every desktop's sound menu would make a
+wrong pick too easy.
+
+### The pools
+
+The default entity carries them after its Playback output 0 and Listen
+input 0, with no devices of their own: `destination_talkers` outputs
+(4 when left out) and `source_listeners` inputs (4). Their sizes are
+settings, not one stream per pin, because streams are in the model
+ID's hash: a stream added at every pin would send every controller back
+to read the model each time a person pins or unpins.
+
+### Destination sinks and pinned sources
+
+- **One device per pin**, there while it is pinned, whether the remote
+  device is on the network or not, what plays into it dropped and the
+  status saying so, rather than vanishing and WirePlumber moving the app
+  to the desktop's speakers without a word:
+  - `node.name` is `avb-dest-<entity id>-in-<input>` or
+    `avb-src-<entity id>-out-<output>`, from the entity ID and the pin's
+    index, so WirePlumber's memory of each app's choice survives a
+    rename; the description is "<device name> <stream name>";
+  - `node.network = true`, and a low session priority, so WirePlumber
+    never makes one the default and desktop sounds never reserve on the
+    network; the default entity's own devices take the same;
+  - at the graph's rate, as every device is, with the stream's side
+    converting.
+- **Connecting.** When the first app stream links to a destination
+  sink, paused or not, the daemon takes a talker from the pool, gives it
+  a format the listener takes at its current rate (read over AECP,
+  never changing the listener's rate), and sends ACMP's connect to the
+  listener as its own controller. A pinned source works the same way the
+  other round, binding a pool listener to the remote talker, which takes
+  nothing from anyone, as talker streams are multicast.
+  - **Busy:** a listener bound to another talker, or acquired or locked
+    by another controller (CONTROLLER_NOT_AUTHORIZED), is busy. The
+    daemon doesn't take it over and doesn't retry in a loop; the status
+    says so. Taking a listener over stays a deliberate act in a
+    controller, as plaa's Play is now.
+  - **Releasing:** after the last app stream unlinks, and 30 s more, the
+    daemon disconnects, so pauses, seeks and track changes don't cost an
+    ACMP and MSRP round each. It disconnects only a binding it made that
+    no one has changed since.
+  - **Running out:** a pool stream per connected pin, given back with
+    the binding. When the pool, the MAAP block (32 talkers) or the
+    bridge's bandwidth runs out, the pin's status says so.
+- **The daemon's controller** has its own entity ID, `FF-FB` in the
+  instance octets, beside triib's controller (`FF-FE`), triib-cli's
+  (`FF-FD`) and plaa's (`FF-FC`). It advertises no entity, so nothing new
+  shows in triib's or Hive's lists, and it acts only on pins.
+- **Status:** each pin with the remote device's name and its state as a
+  plain value an app shows as it shows a talker's: `idle`, `connected`,
+  `busy`, `offline`, `no-talker` or `no-bandwidth`.
+
+### The tool and the apps
+
+- **A neutral tool:** `avb-endpointd on|off`, `pin`, `unpin` and `list`,
+  with `--interface`, starts or stops the unit and edits the file under
+  the lock. No app is needed. Apps do the same through the library,
+  `config::edit` and `unit`.
+- **plaa's** Network Audio becomes a front end: this computer on or off
+  the network, pinning, the pins' and gptpd's states from the status,
+  and its controller for browsing, details and the explicit takeover.
+  Its audio plays into a sink, and listens from a source, by node name.
+  Whether it also goes on playing on the computer's own speakers, as
+  "Send what plays" does now, is plaa's own feature.
+- **triib** is unchanged. It may later offer pins as a front end too.
+
+### Order and decisions
+
+The daemon's controller, the pools and the pinned devices are a step of
+their own, after step 2 and before or after plaa's step, which by then
+plays into the default entity's devices.
+
+Decisions for the user:
+
+- whether to adopt it, and when;
+- pinned only, or `"all"` later too;
+- the 30 s release;
+- pools of 4;
+- `FF-FB` for the daemon's controller.
+
+Later: group sinks, several pinned listeners on one multicast talker
+playing the same audio, as AVB does natively.
+
 ## Plan
 
 1. **Move without changing behaviour.** In the avb repository:
@@ -496,8 +656,9 @@ The link units stay as they are.
      statuses, the link retry, and the three link names.
 
    triib then moves onto it, in triib's session, when the user asks.
-2. **Owners, models, pinned instances, the file lock and inotify.** Also
-   devices at a fixed rate, `node.network`, and migration.
+2. **The default entity, models, pinned instances, the file lock and
+   inotify.** Also devices at a fixed rate, `node.network`, and
+   migration.
 3. **plaa onto it.** The copy of what plays goes into the device, and
    the input is recorded from its device. The in-process entity and its
    MRP code come out on Linux. plaa's README and PLAN catch up: the
@@ -519,6 +680,10 @@ The link units stay as they are.
   or back up (the user, 2026-11-08).
 - The link units give the first transmit queue fq_codel, not fq (the
   user, 2026-11-09).
+- Entities belong to no app: one default entity on each interface,
+  which no app removes, and the others any app adds and removes. The
+  default exists whenever the daemon runs, and one removed by hand is
+  made again from its default values (the user, 2026-11-09).
 - avb-streamd is shelved: the streams' data path stays in avb-endpointd,
   with locked pages and launch time as later steps (the user,
   2026-11-08).
