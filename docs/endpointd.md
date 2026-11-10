@@ -551,7 +551,8 @@ way round: the network's speakers and amp inputs, each a sink of its
 own, which connect when an app plays into them, and remote talkers as
 sources. PipeWire already works that way for other networks: AirPlay
 receivers, Snapcast and ROC appear as local sinks named for the remote
-device.
+device. Any media app, a DAW among them, reaches a destination or a
+source as plaa does, with nothing plaa-specific (the user, 2026-11-10).
 
 It has to serve a home with a few AVB speakers as well as a venue's
 Milan network (the user, 2026-11-10). At home there is nothing to set
@@ -640,6 +641,38 @@ settings, not one stream per device, because streams are in the model
 ID's hash: a stream added for every device would send every controller
 back to read the model each time one comes, goes or is pinned.
 
+### Channels
+
+Every stream the pools and the network devices carry has 2, 8, 16 or
+32 channels, and no other count (the user, 2026-11-10).
+
+- **The pools' formats:** each pool stream lists AAF and AM824 formats
+  of 2, 8, 16 and 32 channels at each rate the daemon's streams take.
+  A list is only what a stream may take: MSRP reserves the current
+  format alone, at connect, so the list costs no bandwidth, and it fits
+  a stream descriptor with room to spare. Being fixed, it never changes
+  the model ID as devices come and go.
+- **Compatible:** a remote input or output is compatible when it
+  accepts one of those counts. One that accepts none, such as an input
+  that takes only one channel, gets no device in "all" mode, and a pin
+  of it says `no-format`.
+- **A device's width:** each sink or source has the widest of those
+  counts its remote stream accepts, so a DAW routes each channel, not a
+  stereo mix. It is made once: when a controller changes the remote
+  stream's current format, the device stays as it is, and the stream
+  carries the channels the current format holds, the rest dropped on a
+  sink and silent on a source. The status says how many are live, as
+  "2 of 8". The device is made again only when the formats the remote
+  stream accepts change, as with new firmware.
+- **Ports** are named by position, AUX0 to AUXn, not by the remote
+  device's cluster names, so a DAW session that saves its connections
+  by port name keeps them through a rename on the device. With
+  `node.name` stable as well, a DAW reaches these devices through
+  PipeWire's JACK layer as it reaches any other.
+- **Latency:** each device keeps the 10 ms margin and the rate
+  conversion every device here has. That suits playback and recording;
+  monitoring live through one carries it.
+
 ### Destination sinks and sources
 
 - **One device for each one shown:** in "all" mode while it is on the
@@ -663,9 +696,14 @@ back to read the model each time one comes, goes or is pinned.
     converting.
 - **Connecting.** When the first app stream links to a destination
   sink, paused or not, the daemon takes a talker from the pool, gives it
-  a format the listener takes at its current rate (read over AECP,
-  never changing the listener's rate), and sends ACMP's connect to the
-  listener as its own controller. A source works the same way the other
+  the listener's current format, read over AECP, and sends ACMP's
+  connect to the listener as its own controller. Where the current
+  format has none of the channel counts above, it first sets the
+  listener, unbound as it is, at its current rate, never changing the
+  rate, to the smallest of those counts it accepts that is at least the
+  current one, or the widest it accepts where none is that large: the
+  reservation follows the format, and a 6-channel listener set to 32
+  would reserve four times what it needs. A source works the same way the other
   round, binding a pool listener to the remote talker, which takes
   nothing from anyone, as talker streams are multicast.
   - **Busy:** a listener bound to another talker, or acquired or locked
@@ -689,24 +727,26 @@ back to read the model each time one comes, goes or is pinned.
 - **Status:** every device found, pinned or not, in one list with the
   same fields, so one list drives a front end's toggles: entity ID,
   input or output index, name, whether it is pinned, remembered or
-  hidden, and its state as a plain value an app shows as it shows a
-  talker's: `idle`, `connected`, `busy`, `offline`, `no-talker` or
-  `no-bandwidth`.
+  hidden, its channels and how many are live, and its state as a plain
+  value an app shows as it shows a talker's: `idle`, `connected`,
+  `busy`, `offline`, `no-talker`, `no-bandwidth` or `no-format`.
 
 ### The tool and the apps
 
 - **A neutral tool:** `avb-endpointd on|off`, `list`, `pin|unpin`,
   `hide|show` and `mode destinations|sources all|pinned`, with
-  `--interface`, taking a device's name or entity ID. It starts or stops the unit and edits the
-  file under the lock. No app is needed. Apps do the same through the
-  library, `config::edit` and `unit`.
+  `--interface`, taking a device's name or entity ID. It starts or
+  stops the unit and edits the file under the lock. No app is needed.
+  Apps do the same through the library, `config::edit` and `unit`.
 - **plaa's** Network Audio becomes a front end: this computer on or off
   the network, the devices found with hide and pin toggles, new devices
   in pinned mode, the devices' and gptpd's states from the status, and
-  its controller for browsing, details and the explicit takeover. Its
-  audio plays into a sink, and listens from a source, by node name.
-  Whether it also goes on playing on the computer's own speakers, as
-  "Send what plays" does now, is plaa's own feature.
+  its controller for browsing, details and the explicit takeover. plaa
+  reaches a destination as any app does, picking its sink as an output
+  device, and records from a source the same way; its controller's
+  connect is an optional extra. Whether it also goes on playing on the
+  computer's own speakers, as "Send what plays" does now, is plaa's own
+  feature.
 - **triib** is unchanged. It may later offer the same as a front end.
 - **Without an AVB app,** a person has the tool or the file. A desktop's
   sound settings can't hide a sink for good, so a small settings panel
@@ -715,8 +755,9 @@ back to read the model each time one comes, goes or is pinned.
 ### Order and decisions
 
 The daemon's controller, the pools and the network devices are a step
-of their own, after step 2 and before or after plaa's step, which by
-then plays into the default entity's devices.
+of their own, after step 2. plaa's step, which plays into the default
+entity's devices, doesn't wait on it; plaa's front end for the network
+devices comes after it.
 
 Settled, with plaa's review (the user, 2026-11-10):
 
@@ -726,7 +767,9 @@ Settled, with plaa's review (the user, 2026-11-10):
 - one sink per compatible input, not per device;
 - devices that also talk shown as well;
 - sources "pinned" by default;
-- the status listing every device found with the same fields.
+- the status listing every device found with the same fields;
+- 2, 8, 16 and 32 channels only, each device as wide as the widest of
+  those its remote stream accepts, made once, with ports AUX0 to AUXn.
 
 Decisions for the user:
 
