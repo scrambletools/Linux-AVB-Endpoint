@@ -1,25 +1,25 @@
 # Linux AVB Endpoint
 
-This computer on an AVB or Milan network, for any app. `avb-endpointd`
-runs this computer's AVB entities on one wired interface, as the
-person's `avb-endpointd@<interface>` user unit. Each entity's stream
-outputs are PipeWire playback devices any app plays into, and its stream
-inputs recording devices any app records from, so a media player, a DAW
-or a browser reaches the network as it reaches speakers and a
-microphone. Any controller (Hive, triib, a Milan device's own) connects
-the streams.
+Puts a Linux computer on an AVB or Milan network as an audio endpoint
+that any app can use. `avb-endpointd` runs the computer's AVB entities
+on one wired interface, as a systemd user unit,
+`avb-endpointd@<interface>`. Each stream output is a PipeWire playback
+device and each stream input a recording device, so a media player, a
+DAW or a browser plays to the network as it would to speakers, and
+records from it as from a microphone. Any controller, such as Hive,
+triib or a Milan device's own, connects the streams.
 
-Every interface the daemon runs on has a default entity, named for the
-computer, with a stereo "Playback" output and "Listen" input. Apps such
-as triib add entities of their own beside it.
+Each interface the daemon runs on has a default entity, named after the
+computer, with a stereo output, "Playback", and a stereo input,
+"Listen". Apps such as triib can add entities of their own beside it.
 
 ## Crates
 
 | Crate | What it is |
 | --- | --- |
-| `avb-endpointd` | The configuration, model, status and meters files apps share with the daemon, and the daemon's unit, as a library on Linux, macOS and Windows; with the `daemon` feature, the daemon itself, for Linux |
-| `avb-pipewire` | The virtual PipeWire devices the daemon gives its streams |
-| `avb-netraw` | The one program granted `CAP_NET_RAW`, which opens raw Ethernet sockets for the daemon and the apps' controllers |
+| [`avb-endpointd`](crates/avb-endpointd) | A library for Linux, macOS and Windows with what apps share with the daemon: its configuration, model, status and meters files, and its user unit. With the `daemon` feature, the daemon itself, for Linux |
+| [`avb-pipewire`](crates/avb-pipewire) | The PipeWire playback and recording devices the daemon gives its streams |
+| [`avb-netraw`](crates/avb-netraw) | A small helper, the only program granted `CAP_NET_RAW`, that opens raw Ethernet sockets for the daemon and for apps' controllers |
 
 The protocol and stream crates they build on, `atdecc`, `avb-net`,
 `avb-mrp` and `avb-stream`, come from
@@ -29,9 +29,9 @@ and gPTP from gptpd, in
 
 ## The files
 
-- `~/.config/avb-endpointd/<interface>.toml`: the entities to run, which
-  apps change through the library's `config::edit`, under the file's
-  lock, and a person may edit by hand.
+- `~/.config/avb-endpointd/<interface>.toml`: the entities to run,
+  which apps change through the library's `config::edit` under the
+  file's lock, and which you can also edit by hand.
 - `$XDG_RUNTIME_DIR/avb-endpointd/<interface>.toml`: what the daemon is
   doing, rewritten every two seconds.
 - `/usr/share/avb-endpointd/models/<model>.toml`: each entity's vendor,

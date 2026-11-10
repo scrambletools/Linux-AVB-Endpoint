@@ -1,6 +1,6 @@
 [package]
 name = "avb-endpointd"
-description = "This computer's AVB entities for any app: the files apps share with the daemon, and, with its feature, the daemon itself"
+description = "Runs a Linux computer's AVB and Milan entities with PipeWire devices any app plays into or records from: a library for the files apps share with the daemon, and the daemon behind a feature"
 version = "0.2.0"
 categories = ["network-programming", "multimedia::audio"]
 keywords = ["avb", "atdecc", "milan", "pipewire"]
@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 include = ["src/**", "data/**", "Cargo.toml"]
 
 [lints]

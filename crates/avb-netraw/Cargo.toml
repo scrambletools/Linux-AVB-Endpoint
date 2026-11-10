@@ -1,6 +1,6 @@
 [package]
 name = "avb-netraw"
-description = "The one program granted CAP_NET_RAW, which opens raw Ethernet sockets for avb-endpointd and the apps"
+description = "A small helper, the only program granted CAP_NET_RAW, that opens raw Ethernet sockets for avb-endpointd and apps' controllers"
 version = "0.1.0"
 categories = ["network-programming"]
 keywords = ["avb", "raw-socket", "capability"]
@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 # Not on crates.io: packages build it from the release tag.
 publish = false
 
