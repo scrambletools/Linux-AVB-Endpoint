@@ -66,9 +66,10 @@ cargo test -p avb-endpointd --features daemon
 cargo build -p avb-endpointd --features daemon && scripts/smoke/held.sh
 ```
 
-`scripts/smoke/held.sh` runs the daemon in a user and network namespace
-beside an older program's entity at the default's instance, and needs
-no root.
+The scripts in `scripts/smoke` run the daemon in a user and network
+namespace on dummy interfaces, and need no root: `held.sh` beside an
+older program's entity at the default's instance, and `instances.sh`
+on two interfaces at once, with a second daemon refused.
 
 To build against unpublished changes to the avb or gptp crates, a
 git-ignored `.cargo/avb-local.toml` can patch them to checkouts beside
