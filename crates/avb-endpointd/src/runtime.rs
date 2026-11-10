@@ -1359,12 +1359,6 @@ impl Runtime {
                 && let Some(config) = self.changed_config()
             {
                 let file = self.file_name();
-                if config.endpoints.is_empty() {
-                    log(format!("{file} lists no entities now, stopping"));
-                    self.shut_down();
-                    self.remove_status();
-                    return Ok(Exit::Stop);
-                }
                 if self.apply(&config) {
                     log(format!("{file} changed, applied"));
                 } else {
@@ -1764,7 +1758,12 @@ impl Runtime {
                             }
                             config = restored;
                         }
-                        Err(error) => log(format!("{}: {error}", self.file_name())),
+                        Err(error) => {
+                            log(format!("{}: {error}", self.file_name()));
+                            // Runs it unsaved, so the computer stays on
+                            // the network.
+                            config.ensure_default(|| name);
+                        }
                     }
                 }
                 (config != self.config).then_some(config)

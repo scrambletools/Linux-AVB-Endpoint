@@ -9,6 +9,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+# Not on crates.io: packages build it from the release tag.
+publish = false
 
 [lints]
 workspace = true

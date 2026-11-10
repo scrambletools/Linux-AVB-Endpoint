@@ -8,8 +8,8 @@
 //! its place. The entities are listed in `<interface>.toml` in the
 //! configuration folder, or the file `--config` names, which it watches
 //! for the apps' changes. With no file it takes triib's entities for the
-//! interface, where triib listed any, and with no entities it has nothing
-//! to do and ends.
+//! interface, where triib listed any. It always runs the default entity,
+//! so it runs until stopped.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -60,11 +60,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let mut config = match first_config(&interface, &path) {
-        Ok(config) if !config.endpoints.is_empty() => config,
-        Ok(_) => {
-            println!("no entities listed for {interface}");
-            return ExitCode::SUCCESS;
-        }
+        Ok(config) => config,
         Err(code) => return code,
     };
     // One of a person's daemons on the interface at a time: another would

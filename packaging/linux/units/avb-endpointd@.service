@@ -6,15 +6,16 @@ After=pipewire.service graphical-session.target
 Wants=pipewire.service
 PartOf=pipewire.service graphical-session.target
 
-# Started by an app as it adds the interface's first entity, and enabled
-# so that it starts with the desktop after. With the graphical session
-# only: elsewhere, as under linger or over SSH, polkit refuses gptpd and
-# the link units, and RealtimeKit the streams' priority.
+# Started by an app as a person puts this computer on the network on the
+# interface, and enabled so that it starts with the desktop after. With
+# the graphical session only: elsewhere, as under linger or over SSH,
+# polkit refuses gptpd and the link units, and RealtimeKit the streams'
+# priority.
 #
-# With no entities listed it ends at once. The exit statuses that are
-# not crashes, as when another person's daemon holds the interface, the
-# interface is not there or the configuration does not parse, end it
-# without starting again.
+# It always runs the default entity, so it runs until stopped. The exit
+# statuses that are not crashes, as when another person's daemon holds
+# the interface, the interface is not there or the configuration does
+# not parse, end it without starting again.
 #
 # The instance is the interface's name as it is, %i, as for gptpd@ and
 # the link units: unescaping it, as %I does, would turn a dash into a
