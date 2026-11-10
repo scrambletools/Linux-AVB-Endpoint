@@ -1,6 +1,6 @@
 [Unit]
 Description=AVB entities on %i
-Documentation=https://github.com/scrambletools/avb/blob/main/docs/endpointd.md
+Documentation=https://github.com/scrambletools/Linux-AVB-Endpoint/blob/main/docs/endpointd.md
 # Its devices are in the session's PipeWire, and start again with it.
 After=pipewire.service graphical-session.target
 Wants=pipewire.service

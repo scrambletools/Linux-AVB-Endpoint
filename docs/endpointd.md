@@ -1,9 +1,10 @@
 # avb-endpointd: this computer's entities, for any app
 
-Status: reviewed by triib (2026-11-08). Step 1 is in avb-endpointd
-0.1.0 and 0.1.1, on main here and in triib. Step 2 is on the
-`endpointd-2` branch here, as avb-endpointd 0.2.0 and avb-pipewire
-0.1.1.
+Status: reviewed by triib (2026-11-08). Steps 1 and 2 began in
+scrambletools/avb, where avb-endpointd 0.1.0 and 0.1.1 were released,
+and moved here with their history (2026-11-09). Step 2 is on main here,
+as avb-endpointd 0.2.0 and avb-pipewire 0.1.1, not yet released; triib
+runs step 1.
 
 ## Why
 
@@ -24,7 +25,7 @@ step-aside logic so that the two don't withdraw each other's
 declarations; a raw socket helper (plaa-netraw, triib-netraw); a link
 unit (plaa-link@, triib-link@); and starting gptpd.
 
-avb-endpointd is triib-endpointd moved into the avb repository and made
+avb-endpointd is triib-endpointd moved out of triib and made
 neutral: one daemon per interface in the person's session, running every
 entity on the computer, whichever app made it. Each stream's audio comes
 from or goes to a PipeWire device. plaa and triib become two ways to
@@ -361,7 +362,7 @@ and stream index, not by stream ID.
 
 ## Audio devices
 
-As triib-pipewire makes them now, moved to the avb repository as
+As triib-pipewire makes them now, moved out of triib as
 `avb-pipewire`:
 
 - **Nodes:** an `Audio/Sink` per stream output and an `Audio/Source`
@@ -486,7 +487,7 @@ The link units stay as they are.
 
 ## Packaging
 
-- **The avb repository** gains:
+- **This repository** holds:
   - `crates/avb-endpointd`, the library on crates.io and the daemon
     behind its feature, and `crates/avb-pipewire` (from triib-endpointd
     and triib-pipewire);
@@ -647,7 +648,8 @@ playing the same audio, as AVB does natively.
 
 ## Plan
 
-1. **Move without changing behaviour.** In the avb repository:
+1. **Move without changing behaviour.** In the avb repository, where it
+   began:
    - triib-endpointd and triib-pipewire become avb-endpointd (library
      and daemon) and avb-pipewire;
    - avb-netraw, the user unit template and the link units;
@@ -680,6 +682,10 @@ playing the same audio, as AVB does natively.
   or back up (the user, 2026-11-08).
 - The link units give the first transmit queue fq_codel, not fq (the
   user, 2026-11-09).
+- avb-endpointd, avb-pipewire and avb-netraw live in their own
+  repository, Linux-AVB-Endpoint, as gptpd and avb-bridged do, with
+  avb's protocol and stream crates from crates.io (the user,
+  2026-11-09).
 - Entities belong to no app: one default entity on each interface,
   which no app removes, and the others any app adds and removes. The
   default exists whenever the daemon runs, and one removed by hand is
