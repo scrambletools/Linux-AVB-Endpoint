@@ -1,7 +1,9 @@
-//! This computer's AVB entities, for any app: one daemon per interface,
-//! `avb-endpointd@<interface>`, runs every entity on the computer, each an
-//! ATDECC entity with streams any controller can connect, its audio from
-//! and to a PipeWire device apps play into or record from.
+//! Runs a Linux computer's AVB and Milan entities, so that any app can
+//! play to and record from the network through PipeWire. One daemon per
+//! interface, the user unit `avb-endpointd@<interface>`, runs every
+//! entity on the computer: each an ATDECC entity whose streams any
+//! controller can connect, with audio from and to a PipeWire device apps
+//! play into or record from.
 //!
 //! Without features the crate is what apps share with the daemon, on
 //! every platform: the entities to run ([`config`]) and the models they
