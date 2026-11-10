@@ -2,9 +2,9 @@
 
 Status: reviewed by triib (2026-11-08). Steps 1 and 2 began in
 scrambletools/avb, where avb-endpointd 0.1.0 and 0.1.1 were released,
-and moved here with their history (2026-11-09). Step 2 is on main here,
-as avb-endpointd 0.2.0 and avb-pipewire 0.1.1, not yet released; triib
-runs step 1.
+and moved here with their history (2026-11-09). Step 2 is released
+from here as avb-endpointd 0.2.0 and avb-pipewire 0.1.1, tagged
+avb-endpointd-v0.2.0 (2026-11-10); triib runs step 1.
 
 ## Why
 
