@@ -563,8 +563,15 @@ which devices show is for networks large enough to need it.
 Two modes for each interface, in its file:
 
 - **`destinations = "all"`, the default.** Every compatible listener
-  input the daemon finds gets a sink, once ADP announces its entity and
-  the daemon has read its model.
+  input the daemon finds on another device gets a sink of its own, once
+  ADP announces its entity and the daemon has read its model, whether
+  the device also talks or not, as an interface or an amp with a
+  monitor output does.
+  - **This computer's own entities are left out:** the daemon's,
+    triib's, and any other advertised from this MAC. A sink into one
+    would play into a local listener whose recording device another app
+    may play back, a loop, and the desktop's own entities would fill
+    every sound menu. A person who wants one pins it.
   - An idle sink costs the network nothing: no talker, reservation or
     bandwidth until an app plays into it. Ten speakers are ten PipeWire
     nodes.
@@ -586,7 +593,11 @@ list grows would make every sink vanish at once because a speaker was
 plugged in. A front end may suggest pinned mode past a dozen or so.
 
 `sources` takes the same two values for remote talkers, as recording
-devices, with the same rules.
+devices, with the same rules, but is `"pinned"` by default. People play
+to speakers far more than they record from the network; "all" would
+double what every recording picker lists; and a meeting app could take
+up a microphone in another room that no one chose. A front end offers
+the talkers found, to pin.
 
 ### The settings
 
@@ -596,7 +607,7 @@ lock like any change, by a person, an app, the tool or the daemon:
 ```toml
 # ~/.config/avb-endpointd/enp2s0.toml
 destinations = "all"            # or "pinned"
-sources = "all"
+sources = "pinned"              # or "all"
 
 [[hide]]
 entity = "0x001b92fffe0123ab"
@@ -638,8 +649,13 @@ back to read the model each time one comes, goes or is pinned.
   moving the app to the desktop's speakers without a word.
   - `node.name` is `avb-dest-<entity id>-in-<input>` or
     `avb-src-<entity id>-out-<output>`, from the entity ID and index,
-    so WirePlumber's memory of each app's choice survives a rename; the
-    description is "<device name> <stream name>";
+    so WirePlumber's memory of each app's choice survives a rename;
+  - one per compatible input or output, not one per device, as a sink
+    across several inputs would split channels the pools don't, and an
+    amp with several inputs is where a person wants to choose; the
+    description is "<device name> <stream name>", or the device's name
+    alone where it has one compatible stream that way, as most home
+    speakers do;
   - `node.network = true`, and a low session priority, so WirePlumber
     never makes one the default and desktop sounds never reserve on the
     network; the default entity's own devices take the same;
@@ -670,16 +686,18 @@ back to read the model each time one comes, goes or is pinned.
   (`FF-FD`) and plaa's (`FF-FC`). It advertises no entity, so nothing new
   shows in triib's or Hive's lists, and it acts only on the devices it
   shows, when an app plays into or records from one.
-- **Status:** each device found, with its name, whether it is shown,
-  pinned or hidden, and its state as a plain value an app shows as it
-  shows a talker's: `idle`, `connected`, `busy`, `offline`, `no-talker`
-  or `no-bandwidth`.
+- **Status:** every device found, pinned or not, in one list with the
+  same fields, so one list drives a front end's toggles: entity ID,
+  input or output index, name, whether it is pinned, remembered or
+  hidden, and its state as a plain value an app shows as it shows a
+  talker's: `idle`, `connected`, `busy`, `offline`, `no-talker` or
+  `no-bandwidth`.
 
 ### The tool and the apps
 
 - **A neutral tool:** `avb-endpointd on|off`, `list`, `pin|unpin`,
-  `hide|show` and `mode all|pinned`, with `--interface`, taking a
-  device's name or entity ID. It starts or stops the unit and edits the
+  `hide|show` and `mode destinations|sources all|pinned`, with
+  `--interface`, taking a device's name or entity ID. It starts or stops the unit and edits the
   file under the lock. No app is needed. Apps do the same through the
   library, `config::edit` and `unit`.
 - **plaa's** Network Audio becomes a front end: this computer on or off
@@ -700,19 +718,19 @@ The daemon's controller, the pools and the network devices are a step
 of their own, after step 2 and before or after plaa's step, which by
 then plays into the default entity's devices.
 
+Settled, with plaa's review (the user, 2026-11-10):
+
+- destinations "all" by default, remembering on first use, with `hide`,
+  and "pinned" for large networks;
+- this computer's own entities left out of "all";
+- one sink per compatible input, not per device;
+- devices that also talk shown as well;
+- sources "pinned" by default;
+- the status listing every device found with the same fields.
+
 Decisions for the user:
 
 - whether to adopt it, and when;
-- "all" as the default, with remembering on first use and `hide`, and
-  "pinned" for large networks;
-- in "all" mode, one sink per compatible input, or one per device on its
-  first compatible input, as a device with many inputs, such as an
-  interface, would fill the list;
-- whether "all" shows only entities that listen and don't talk, as most
-  speakers and amps do, leaving out interfaces, mixers and other
-  computers, which also talk;
-- whether `sources` defaults to "all" too, which would show other
-  computers' outputs as recording devices;
 - the 30 s release;
 - pools of 4;
 - `FF-FB` for the daemon's controller.
