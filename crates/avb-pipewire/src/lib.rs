@@ -12,6 +12,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use avb_stream::audio::{FrameBuffer, SharedBuffer};
 
@@ -33,6 +34,7 @@ pub struct DeviceSpec {
 /// A virtual device, there while it lives.
 pub struct VirtualDevice {
     shared: SharedBuffer,
+    in_use: Arc<AtomicBool>,
     _remove: imp::Remover,
 }
 
@@ -41,6 +43,13 @@ impl VirtualDevice {
     /// for apps to record.
     pub fn shared(&self) -> SharedBuffer {
         self.shared.clone()
+    }
+
+    /// Whether an app plays into it or records from it: PipeWire runs
+    /// it while an app's stream is linked to it, and suspends it a few
+    /// seconds after the last goes.
+    pub fn in_use(&self) -> bool {
+        self.in_use.load(Ordering::Relaxed)
     }
 }
 
@@ -71,13 +80,15 @@ impl VirtualAudio {
         let rate = spec.rate.max(1);
         // 10 ms kept beyond PipeWire's chunks, as for an audio device.
         let buffer = Arc::new(FrameBuffer::new(channels, rate as usize / 100));
-        let remove = self.inner.add(&spec, buffer.clone())?;
+        let in_use = Arc::new(AtomicBool::new(false));
+        let remove = self.inner.add(&spec, buffer.clone(), in_use.clone())?;
         Ok(VirtualDevice {
             shared: SharedBuffer {
                 buffer,
                 channels,
                 rate,
             },
+            in_use,
             _remove: remove,
         })
     }
@@ -87,7 +98,7 @@ impl VirtualAudio {
 mod imp {
     use std::collections::HashMap;
     use std::io;
-    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread::JoinHandle;
 
@@ -104,6 +115,7 @@ mod imp {
             id: u64,
             spec: DeviceSpec,
             buffer: Arc<FrameBuffer>,
+            in_use: Arc<AtomicBool>,
             done: mpsc::Sender<io::Result<()>>,
         },
         Remove(u64),
@@ -159,7 +171,12 @@ mod imp {
             self.rate
         }
 
-        pub fn add(&self, spec: &DeviceSpec, buffer: Arc<FrameBuffer>) -> io::Result<Remover> {
+        pub fn add(
+            &self,
+            spec: &DeviceSpec,
+            buffer: Arc<FrameBuffer>,
+            in_use: Arc<AtomicBool>,
+        ) -> io::Result<Remover> {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
             let (done, result) = mpsc::channel();
             self.sender
@@ -167,6 +184,7 @@ mod imp {
                     id,
                     spec: spec.clone(),
                     buffer,
+                    in_use,
                     done,
                 })
                 .map_err(|_| error("its thread ended"))?;
@@ -254,9 +272,10 @@ mod imp {
                 id,
                 spec,
                 buffer,
+                in_use,
                 done,
             } => {
-                let result = add(&core, &spec, buffer).map(|device| {
+                let result = add(&core, &spec, buffer, in_use).map(|device| {
                     owned.borrow_mut().insert(id, device);
                 });
                 let _ = done.send(result);
@@ -318,6 +337,7 @@ mod imp {
         core: &pw::core::CoreRc,
         spec: &DeviceSpec,
         buffer: Arc<FrameBuffer>,
+        in_use: Arc<AtomicBool>,
     ) -> io::Result<Device> {
         let channels = usize::from(spec.channels.max(1));
         let stream = pw::stream::StreamRc::new(
@@ -346,6 +366,12 @@ mod imp {
         let mut samples: Vec<f32> = Vec::new();
         let listener = stream
             .add_local_listener_with_user_data(())
+            .state_changed(move |_, _, _, now| {
+                in_use.store(
+                    matches!(now, pw::stream::StreamState::Streaming),
+                    Ordering::Relaxed,
+                );
+            })
             .io_changed(move |_, _, id, area, _| {
                 if id == spa::sys::SPA_IO_Position {
                     watching.store(area.cast(), Ordering::Release);
@@ -428,6 +454,8 @@ mod imp {
     use std::io;
     use std::sync::Arc;
 
+    use std::sync::atomic::AtomicBool;
+
     use avb_stream::audio::FrameBuffer;
 
     use super::DeviceSpec;
@@ -448,7 +476,12 @@ mod imp {
             48_000
         }
 
-        pub fn add(&self, _: &DeviceSpec, _: Arc<FrameBuffer>) -> io::Result<Remover> {
+        pub fn add(
+            &self,
+            _: &DeviceSpec,
+            _: Arc<FrameBuffer>,
+            _: Arc<AtomicBool>,
+        ) -> io::Result<Remover> {
             Ok(Remover)
         }
     }

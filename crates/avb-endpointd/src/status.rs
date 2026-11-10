@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Direction;
+use crate::devices::{DeviceState, RemoteStream, Way};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DaemonStatus {
     pub pid: u32,
     /// When it started on the endpoints it runs, in milliseconds since the
@@ -38,6 +40,77 @@ pub struct DaemonStatus {
     pub sharers: Vec<SharerStatus>,
     #[serde(rename = "endpoint", default)]
     pub endpoints: Vec<EndpointStatus>,
+    /// The streams on other devices the daemon found or the file pins,
+    /// in one list whether each has a device here or not, so an app's pin
+    /// and hide toggles follow it.
+    #[serde(rename = "device", default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceStatus>,
+}
+
+/// A stream on another device: a listener input, a destination apps play
+/// into, or a talker output, a source apps record from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DeviceStatus {
+    /// Its entity, as text: `0x` and sixteen hex digits.
+    pub entity_id: String,
+    pub way: Way,
+    /// Its STREAM_INPUT or STREAM_OUTPUT descriptor's index.
+    pub index: u16,
+    /// The device's name and the stream's, as an app shows them.
+    pub name: String,
+    /// It has a device here: pinned, or found in "all" mode and not
+    /// hidden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shown: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// The daemon pinned it as an app first used it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remembered: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// Its device's PipeWire node name, while it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Its device's channels, and how many of them its stream's current
+    /// format carries: "2 of 8" where a controller set it narrower.
+    #[serde(default)]
+    pub channels: u16,
+    #[serde(default)]
+    pub live_channels: u16,
+    pub state: DeviceState,
+}
+
+impl DeviceStatus {
+    /// The stream it is.
+    pub fn stream(&self) -> Option<RemoteStream> {
+        let entity = crate::devices::parse_entity_id(&self.entity_id).ok()?;
+        Some(RemoteStream {
+            entity,
+            way: self.way,
+            index: self.index,
+        })
+    }
+}
+
+impl Default for DeviceStatus {
+    fn default() -> Self {
+        DeviceStatus {
+            entity_id: String::new(),
+            way: Way::Destination,
+            index: 0,
+            name: String::new(),
+            shown: false,
+            pinned: false,
+            remembered: false,
+            hidden: false,
+            node: None,
+            channels: 0,
+            live_channels: 0,
+            state: DeviceState::Idle,
+        }
+    }
 }
 
 impl DaemonStatus {
@@ -51,7 +124,8 @@ impl DaemonStatus {
 
 /// A program sharing the daemon's MRP participant: what it declares and
 /// listens to through it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SharerStatus {
     /// Its talkers' streams.
     pub talkers: usize,
@@ -79,6 +153,7 @@ impl SharerStatus {
 /// What the daemon is setting up, or misses, that its entities wait on
 /// to reach controllers or keep the network's time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
 pub enum Setup {
     /// A link unit runs, which takes the link down for a moment.
@@ -115,6 +190,7 @@ impl Setup {
 /// something in the way: not a stream merely waiting for a listener or
 /// a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
 pub enum Blocked {
     /// A link unit runs, which takes the link down for a moment.
@@ -139,7 +215,8 @@ pub enum Blocked {
 }
 
 /// This computer's clock as gptpd runs it on the interface.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClockStatus {
     /// The grandmaster it follows, or this computer as grandmaster, as
     /// text, `0x` and sixteen hex digits.
@@ -174,7 +251,8 @@ impl ClockStatus {
 }
 
 /// One of this computer's entities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EndpointStatus {
     /// As text, `0x` and sixteen hex digits.
     pub entity_id: String,
@@ -204,6 +282,7 @@ pub struct EndpointStatus {
 
 /// One of a device's streams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamStatus {
     pub direction: Direction,
     /// A media clock stream rather than audio.
@@ -219,6 +298,20 @@ pub struct StreamStatus {
     /// What keeps it from streaming or listening, where something does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+}
+
+impl Default for StreamStatus {
+    fn default() -> Self {
+        StreamStatus {
+            direction: Direction::Out,
+            clock: false,
+            name: String::new(),
+            channels: 0,
+            audio: String::new(),
+            state: String::new(),
+            blocked: None,
+        }
+    }
 }
 
 /// The daemon's exit statuses that are not crashes, which its unit does
@@ -405,10 +498,44 @@ mod tests {
                     blocked: Some(Blocked::NoDevice),
                 }],
             }],
+            devices: vec![DeviceStatus {
+                entity_id: "0x001b92fffe0123ab".into(),
+                way: Way::Destination,
+                index: 0,
+                name: "Living room Input 1".into(),
+                shown: true,
+                pinned: true,
+                remembered: true,
+                hidden: false,
+                node: Some("avb-dest-001b92fffe0123ab-in-0".into()),
+                channels: 8,
+                live_channels: 2,
+                state: DeviceState::Connected,
+            }],
         };
         let text = toml::to_string(&status).unwrap();
         let read: DaemonStatus = toml::from_str(&text).unwrap();
         assert_eq!(read, status);
+        assert_eq!(
+            read.devices[0].stream(),
+            Some(RemoteStream::destination(
+                atdecc::EntityId(0x001b_92ff_fe01_23ab),
+                0
+            ))
+        );
+        assert!(text.contains("[[device]]"), "{text}");
+        // A status from before the network devices has none.
+        let before: String = text
+            .split("[[device]]")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            toml::from_str::<DaemonStatus>(&before)
+                .unwrap()
+                .devices
+                .is_empty()
+        );
         // Only the program that cannot take its streams over loses them.
         assert_eq!(read.cut_off(), 2);
         assert_eq!(read.clock.unwrap().grandmaster(), Some(grandmaster));

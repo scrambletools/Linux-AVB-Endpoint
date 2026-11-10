@@ -21,11 +21,13 @@ use atdecc::stream_format::StreamFormat;
 use avb_stream::audio::{Sink, Source};
 use serde::{Deserialize, Serialize};
 
+use crate::devices::{RemoteStream, Way};
 use crate::store::{self, LoadError};
 
 /// The entities on one interface, the file's name: wired, with a PTP
-/// hardware clock that gptpd stamps gPTP's messages with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// hardware clock that gptpd stamps gPTP's messages with; and which
+/// streams on other devices get a device of their own here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Whether the endpoints may fall back to AVB Lite.
@@ -45,8 +47,126 @@ pub struct Config {
     /// whose VLANs cannot be set up (AVB Lite profile, 7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_vlan: Option<u16>,
+    /// Which listener inputs on other devices get a sink here: every
+    /// compatible one but those hidden, the default, or only those pinned.
+    #[serde(skip_serializing_if = "Shown::is_all")]
+    pub destinations: Shown,
+    /// Which talker outputs on other devices get a recording device here:
+    /// only those pinned, the default, or every compatible one but those
+    /// hidden.
+    #[serde(skip_serializing_if = "Shown::is_pinned")]
+    pub sources: Shown,
+    /// How many talkers the default entity keeps for destinations, 4
+    /// when not given: one for each destination an app plays into at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_talkers: Option<u8>,
+    /// How many listeners the default entity keeps for sources, 4 when
+    /// not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_listeners: Option<u8>,
     #[serde(rename = "endpoint")]
     pub endpoints: Vec<EndpointConfig>,
+    /// Streams on other devices that get no device here in "all" mode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hide: Vec<DeviceEntry>,
+    /// Streams on other devices that keep their device here, whether on
+    /// the network or not: pinned by a person or an app, or remembered
+    /// as an app first used them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pin: Vec<DeviceEntry>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            avb_lite: LiteChoice::default(),
+            multicast_escalation: false,
+            unicast_fanout: None,
+            media_vlan: None,
+            destinations: Shown::All,
+            sources: Shown::Pinned,
+            destination_talkers: None,
+            source_listeners: None,
+            endpoints: Vec::new(),
+            hide: Vec::new(),
+            pin: Vec::new(),
+        }
+    }
+}
+
+/// Which streams on other devices one way gets a device of its own here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Shown {
+    /// Every compatible one found, but those hidden; and those pinned.
+    All,
+    /// Only those pinned.
+    Pinned,
+}
+
+impl Shown {
+    fn is_all(&self) -> bool {
+        *self == Shown::All
+    }
+
+    fn is_pinned(&self) -> bool {
+        *self == Shown::Pinned
+    }
+}
+
+/// The talkers or listeners a pool keeps when the file gives no number.
+pub const POOL: u8 = 4;
+
+/// A stream on another device as the file lists it, to pin or to hide:
+/// its entity, `input` for a destination or `output` for a source, and
+/// its name, for a person reading the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    #[serde(with = "crate::devices::entity_id_text")]
+    pub entity: EntityId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u16>,
+    /// The device's name and the stream's, as the daemon last read them.
+    /// Only for reading: no node name uses it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Its device's channels, as the daemon last found the stream, so
+    /// that a pinned one off the network keeps its device as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
+    /// Pinned by the daemon as an app first played into or recorded from
+    /// it, rather than by a person or an app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remembered: bool,
+}
+
+impl DeviceEntry {
+    pub fn new(stream: RemoteStream, name: impl Into<String>) -> Self {
+        let (input, output) = match stream.way {
+            Way::Destination => (Some(stream.index), None),
+            Way::Source => (None, Some(stream.index)),
+        };
+        DeviceEntry {
+            entity: stream.entity,
+            input,
+            output,
+            name: name.into(),
+            channels: None,
+            remembered: false,
+        }
+    }
+
+    /// The stream it names: `None` where it names both an input and an
+    /// output, or neither.
+    pub fn stream(&self) -> Option<RemoteStream> {
+        match (self.input, self.output) {
+            (Some(input), None) => Some(RemoteStream::destination(self.entity, input)),
+            (None, Some(output)) => Some(RemoteStream::source(self.entity, output)),
+            _ => None,
+        }
+    }
 }
 
 /// When the endpoints run AVB Lite.
@@ -582,6 +702,142 @@ impl Config {
         true
     }
 
+    /// Which streams one way gets a device here.
+    pub fn shown(&self, way: Way) -> Shown {
+        match way {
+            Way::Destination => self.destinations,
+            Way::Source => self.sources,
+        }
+    }
+
+    /// Sets which streams one way gets a device here; whether that
+    /// changed it.
+    pub fn set_shown(&mut self, way: Way, shown: Shown) -> bool {
+        let mode = match way {
+            Way::Destination => &mut self.destinations,
+            Way::Source => &mut self.sources,
+        };
+        let changed = *mode != shown;
+        *mode = shown;
+        changed
+    }
+
+    /// The talkers the default entity keeps for destinations.
+    pub fn talker_pool(&self) -> u8 {
+        self.destination_talkers.unwrap_or(POOL)
+    }
+
+    /// The listeners the default entity keeps for sources.
+    pub fn listener_pool(&self) -> u8 {
+        self.source_listeners.unwrap_or(POOL)
+    }
+
+    /// Whether any stream on another device may get a device here, so
+    /// the daemon looks for them: in "all" mode either way, or pinned.
+    pub fn wants_devices(&self) -> bool {
+        self.destinations == Shown::All || self.sources == Shown::All || !self.pin.is_empty()
+    }
+
+    /// Whether `stream`, found on the network, gets a device here: pinned,
+    /// or in "all" mode and not hidden. A pinned one keeps its device off
+    /// the network too.
+    pub fn shows(&self, stream: &RemoteStream) -> bool {
+        self.is_pinned(stream) || (self.shown(stream.way) == Shown::All && !self.is_hidden(stream))
+    }
+
+    pub fn is_pinned(&self, stream: &RemoteStream) -> bool {
+        listed(&self.pin, stream).is_some()
+    }
+
+    pub fn is_hidden(&self, stream: &RemoteStream) -> bool {
+        listed(&self.hide, stream).is_some()
+    }
+
+    /// Pins `stream`, named `name`, so its device stays whether it is on
+    /// the network or not, and shows it where it was hidden. A person's or
+    /// an app's pin, not `remembered`, makes a remembered one their own.
+    /// Whether that changed anything.
+    pub fn pin(&mut self, stream: RemoteStream, name: &str, remembered: bool) -> bool {
+        let mut changed = unlist(&mut self.hide, &stream);
+        match self
+            .pin
+            .iter_mut()
+            .find(|entry| entry.stream() == Some(stream))
+        {
+            Some(entry) => {
+                if entry.remembered && !remembered {
+                    entry.remembered = false;
+                    changed = true;
+                }
+                if entry.name.is_empty() && !name.is_empty() {
+                    entry.name = name.into();
+                    changed = true;
+                }
+            }
+            None => {
+                self.pin.push(DeviceEntry {
+                    remembered,
+                    ..DeviceEntry::new(stream, name)
+                });
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Unpins `stream`, remembered or not; whether it was pinned.
+    pub fn unpin(&mut self, stream: &RemoteStream) -> bool {
+        unlist(&mut self.pin, stream)
+    }
+
+    /// Hides `stream`, named `name`, and unpins it, so it gets no device
+    /// here in either mode; whether that changed anything.
+    pub fn hide(&mut self, stream: RemoteStream, name: &str) -> bool {
+        let unpinned = unlist(&mut self.pin, &stream);
+        if listed(&self.hide, &stream).is_some() {
+            return unpinned;
+        }
+        self.hide.push(DeviceEntry::new(stream, name));
+        true
+    }
+
+    /// Shows `stream` again where it was hidden; whether it was.
+    pub fn show(&mut self, stream: &RemoteStream) -> bool {
+        unlist(&mut self.hide, stream)
+    }
+
+    /// Keeps `stream`'s name and its device's channels current wherever
+    /// the file lists it, as the daemon found it; whether that changed
+    /// anything.
+    pub fn note_stream(&mut self, stream: &RemoteStream, name: &str, channels: u16) -> bool {
+        let mut changed = false;
+        for entry in self.pin.iter_mut().chain(self.hide.iter_mut()) {
+            if entry.stream().as_ref() != Some(stream) {
+                continue;
+            }
+            if !name.is_empty() && entry.name != name {
+                entry.name = name.into();
+                changed = true;
+            }
+            if channels > 0 && entry.channels != Some(channels) {
+                entry.channels = Some(channels);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The settings of the port itself, as against the entities and the
+    /// network devices: a change to them starts the daemon again.
+    pub fn port_settings(&self) -> (LiteChoice, bool, Option<u8>, Option<u16>) {
+        (
+            self.avb_lite,
+            self.multicast_escalation,
+            self.unicast_fanout,
+            self.media_vlan,
+        )
+    }
+
     /// Keeps the first entity marked default as the default, the others
     /// ordinary.
     fn keep_one_default(&mut self) {
@@ -593,6 +849,18 @@ impl Config {
             }
         }
     }
+}
+
+fn listed<'a>(entries: &'a [DeviceEntry], stream: &RemoteStream) -> Option<&'a DeviceEntry> {
+    entries
+        .iter()
+        .find(|entry| entry.stream().as_ref() == Some(stream))
+}
+
+fn unlist(entries: &mut Vec<DeviceEntry>, stream: &RemoteStream) -> bool {
+    let before = entries.len();
+    entries.retain(|entry| entry.stream().as_ref() != Some(stream));
+    entries.len() != before
 }
 
 /// Where the entities on `interface` are listed: `<interface>.toml` in the
@@ -1262,5 +1530,120 @@ mod tests {
         .expect("writes");
         assert_eq!(text.matches("clock = true").count(), 1, "{text}");
         assert_eq!(entry(&text), device);
+    }
+
+    const SPEAKER: EntityId = EntityId(0x001b_92ff_fe01_23ab);
+
+    /// With nothing set, destinations show in "all" mode and sources only
+    /// pinned, and the file says neither.
+    #[test]
+    fn network_devices_default_to_all_destinations_and_pinned_sources() {
+        let config = Config::default();
+        let input = RemoteStream::destination(SPEAKER, 0);
+        let output = RemoteStream::source(SPEAKER, 0);
+        assert!(config.shows(&input));
+        assert!(!config.shows(&output));
+        assert_eq!((config.talker_pool(), config.listener_pool()), (POOL, POOL));
+        let written = toml::to_string(&config).unwrap();
+        assert!(!written.contains("destinations"), "{written}");
+        assert!(!written.contains("sources"), "{written}");
+        // A file that says nothing of them reads the same.
+        let read: Config = toml::from_str("avb_lite = \"auto\"\n").unwrap();
+        assert_eq!(read, config);
+    }
+
+    /// Hiding takes a stream out of "all" mode and unpins it; pinning
+    /// shows it in either mode and takes it off the hidden list; a
+    /// person's pin makes a remembered one theirs.
+    #[test]
+    fn pins_and_hides_keep_each_other_straight() {
+        let mut config = Config::default();
+        let input = RemoteStream::destination(SPEAKER, 1);
+        assert!(config.hide(input, "Sub"));
+        assert!(!config.shows(&input));
+        assert!(!config.hide(input, "Sub"), "hidden already");
+        assert!(config.pin(input, "Sub", true));
+        assert!(config.shows(&input) && !config.is_hidden(&input));
+        assert!(config.pin[0].remembered);
+        assert!(config.pin(input, "Sub", false), "a person's pin");
+        assert!(!config.pin[0].remembered);
+        assert!(!config.pin(input, "Sub", false), "pinned already");
+        config.set_shown(Way::Destination, Shown::Pinned);
+        assert!(config.shows(&input));
+        assert!(config.unpin(&input));
+        assert!(!config.shows(&input));
+        config.set_shown(Way::Destination, Shown::All);
+        assert!(config.shows(&input));
+        assert!(config.hide(input, "Sub"));
+        assert!(config.pin(input, "", false));
+        assert!(config.hide.is_empty() && config.pin.len() == 1);
+        assert!(config.hide(input, "Sub"));
+        assert!(config.pin.is_empty(), "hiding unpins");
+        assert!(config.show(&input));
+        assert!(config.shows(&input));
+    }
+
+    /// Pins and hidden streams read back as written, as tables naming
+    /// their entity in hex, an input or an output, and a name; one naming
+    /// both an input and an output names no stream and shows nothing.
+    #[test]
+    fn device_entries_read_back_as_written() {
+        let mut config = Config::default();
+        config.set_shown(Way::Source, Shown::All);
+        config.pin(RemoteStream::destination(SPEAKER, 0), "Living room", true);
+        config.hide(RemoteStream::source(SPEAKER, 2), "Mic 3");
+        config.endpoints = vec![EndpointConfig::default_entity("desk", DEFAULT_INSTANCE)];
+        let written = toml::to_string(&config).expect("writes");
+        assert!(written.contains("sources = \"all\""), "{written}");
+        assert!(written.contains("[[pin]]"), "{written}");
+        assert!(
+            written.contains("entity = \"0x001b92fffe0123ab\""),
+            "{written}"
+        );
+        assert!(written.contains("remembered = true"), "{written}");
+        let read: Config = toml::from_str(&written).expect("reads");
+        assert_eq!(read, config);
+        let both: Config =
+            toml::from_str("[[pin]]\nentity = \"0x1\"\ninput = 0\noutput = 0\n").unwrap();
+        assert_eq!(both.pin[0].stream(), None);
+        assert!(!both.shows(&RemoteStream::source(EntityId(1), 0)));
+    }
+
+    /// The daemon starts again for the port's settings, not for pins or
+    /// modes, which it takes in place.
+    #[test]
+    fn only_the_ports_settings_start_the_daemon_again() {
+        let before = Config::default();
+        let mut pinned = before.clone();
+        pinned.pin(RemoteStream::destination(SPEAKER, 0), "Living room", false);
+        pinned.set_shown(Way::Destination, Shown::Pinned);
+        assert_eq!(pinned.port_settings(), before.port_settings());
+        let lite = Config {
+            avb_lite: LiteChoice::Off,
+            ..before.clone()
+        };
+        assert_ne!(lite.port_settings(), before.port_settings());
+    }
+
+    /// An app's pin goes through the edit lock and keeps the default
+    /// entity, as any edit does.
+    #[test]
+    fn an_edit_pins_and_keeps_the_default() {
+        let dir = scratch("pin");
+        let path = dir.join("d0.toml");
+        let mut config = Config::default();
+        config.ensure_default(|| "desk".into());
+        store::save(&path, &config).unwrap();
+        let stream = RemoteStream::destination(SPEAKER, 0);
+        let pinned = edit_at(&path, |config| {
+            config.endpoints.clear();
+            config.pin(stream, "Living room", false)
+        })
+        .unwrap();
+        assert!(pinned);
+        let read = load(&path).unwrap();
+        assert!(read.is_pinned(&stream));
+        assert!(read.default_entity().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

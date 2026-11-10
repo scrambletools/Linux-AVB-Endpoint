@@ -40,6 +40,8 @@ use crate::config::{
     Config, Direction, EndpointConfig, LiteChoice, MOST_STREAMS, SrClass, StreamConfig,
     binding_text,
 };
+use crate::devices::{self, FoundStream, RemoteStream, Way};
+use crate::discovery::Discovery;
 use crate::gptp;
 use crate::lite::{self, Declared};
 use crate::meters::{self, Meters, StreamMeter};
@@ -968,6 +970,13 @@ pub struct Runtime {
     /// When the entities begin advertising, having asked first whether
     /// another program here advertises their IDs; `None` once they have.
     begin_at: Option<Duration>,
+    /// The daemon's controller, finding the streams on other devices
+    /// for the network devices, while the file wants any.
+    discovery: Option<Discovery>,
+    /// The streams on other devices it found, and the devices of those
+    /// shown, each with its channels.
+    found: Vec<FoundStream>,
+    network_devices: HashMap<RemoteStream, (u16, VirtualDevice)>,
     /// Whether an app asked for the meters when the daemon last looked,
     /// when that was, when it last wrote them and how many times, and each
     /// running stream's peaks in that write.
@@ -1308,6 +1317,9 @@ impl Runtime {
             touched: false,
             held: HashMap::new(),
             begin_at: None,
+            discovery: None,
+            found: Vec::new(),
+            network_devices: HashMap::new(),
             meters_wanted: false,
             meters_looked: Clock::now(),
             meters_written: Clock::now(),
@@ -1334,6 +1346,7 @@ impl Runtime {
         let now = self.now();
         let since = self.elapsed();
         self.ask_before_advertising(since);
+        self.update_discovery();
         // Every endpoint takes part in class A on VLAN 2, declared once for
         // the port; talkers declare their streams once MAAP gives them
         // addresses.
@@ -1368,6 +1381,7 @@ impl Runtime {
                 let file = self.file_name();
                 if self.apply(&config) {
                     log(format!("{file} changed, applied"));
+                    self.update_discovery();
                 } else {
                     log(format!("{file} changed, starting again"));
                     self.shut_down();
@@ -1403,11 +1417,7 @@ impl Runtime {
     /// `false` when the daemon must start again, as for another interface
     /// or more talkers than the MAAP block holds.
     fn apply(&mut self, config: &Config) -> bool {
-        let port = |config: &Config| Config {
-            endpoints: Vec::new(),
-            ..config.clone()
-        };
-        if port(config) != port(&self.config) {
+        if config.port_settings() != self.config.port_settings() {
             return false;
         }
         let instances: Vec<u8> = config
@@ -1636,6 +1646,99 @@ impl Runtime {
             }
         }
         self.begin_at = Some(since + ASK_FIRST);
+    }
+
+    /// Starts the daemon's controller where the file wants any network
+    /// device, and stops it where it wants none.
+    fn update_discovery(&mut self) {
+        let wanted = self.config.wants_devices();
+        if wanted && self.discovery.is_none() {
+            self.discovery = Some(Discovery::new(self.mac));
+        } else if !wanted {
+            self.discovery = None;
+        }
+        self.sync_network_devices();
+    }
+
+    /// Gives each stream on another device the file shows a device of its
+    /// own, as wide as its stream takes, and takes the device from one
+    /// no longer shown; and keeps the names and channels the file lists
+    /// for pinned and hidden streams current.
+    fn sync_network_devices(&mut self) {
+        self.found = self
+            .discovery
+            .as_ref()
+            .map(Discovery::found)
+            .unwrap_or_default();
+        let wanted: HashMap<RemoteStream, (u16, String)> =
+            devices::statuses(&self.config, &self.found)
+                .into_iter()
+                .filter(|status| status.shown && status.channels > 0)
+                .filter_map(|status| Some((status.stream()?, (status.channels, status.name))))
+                .collect();
+        let gone: Vec<RemoteStream> = self
+            .network_devices
+            .iter()
+            .filter(|(stream, (channels, _))| {
+                wanted.get(stream).is_none_or(|(wide, _)| wide != channels)
+            })
+            .map(|(stream, _)| *stream)
+            .collect();
+        for stream in gone {
+            self.network_devices.remove(&stream);
+            log(format!("{}: device removed", stream.node_name()));
+        }
+        if self.audio.is_none() && !wanted.is_empty() {
+            match VirtualAudio::start() {
+                Ok(audio) => self.audio = Some(audio),
+                Err(error) => log(format!("no virtual audio devices: {error}")),
+            }
+        }
+        if let Some(audio) = &self.audio {
+            for (stream, (channels, name)) in &wanted {
+                if self.network_devices.contains_key(stream) {
+                    continue;
+                }
+                let spec = DeviceSpec {
+                    name: stream.node_name(),
+                    description: name.clone(),
+                    channels: *channels,
+                    rate: audio.rate(),
+                    playback: stream.way == Way::Destination,
+                };
+                match audio.add(spec) {
+                    Ok(device) => {
+                        log(format!(
+                            "{name}: device {}, {channels} channels",
+                            stream.node_name()
+                        ));
+                        self.network_devices.insert(*stream, (*channels, device));
+                    }
+                    Err(error) => log(format!("{name}: no virtual audio device: {error}")),
+                }
+            }
+        }
+        let noted: Vec<(RemoteStream, String, u16)> = self
+            .found
+            .iter()
+            .filter(|found| {
+                self.config.is_pinned(&found.stream) || self.config.is_hidden(&found.stream)
+            })
+            .map(|found| {
+                let channels = devices::device_channels(found.accepted.iter().copied());
+                (found.stream, found.name.clone(), channels.unwrap_or(0))
+            })
+            .filter(|(stream, name, channels)| {
+                self.config.clone().note_stream(stream, name, *channels)
+            })
+            .collect();
+        if !noted.is_empty() {
+            self.write_back(|config| {
+                for (stream, name, channels) in &noted {
+                    config.note_stream(stream, name, *channels);
+                }
+            });
+        }
     }
 
     /// Begins the entities no other program here answered for, once the
@@ -1958,6 +2061,7 @@ impl Runtime {
             setup,
             sharers: self.sharers.statuses(),
             endpoints,
+            devices: devices::statuses(&self.config, &self.found),
         };
         let _ = crate::store::save(&path, &status);
     }
@@ -2131,6 +2235,11 @@ impl Runtime {
             .meters_wanted
             .then(|| meters::EVERY.saturating_sub(self.meters_written.elapsed()));
         let begin = self.begin_at.map(|at| at.saturating_sub(since));
+        let discovery = self
+            .discovery
+            .as_ref()
+            .and_then(Discovery::poll_timeout)
+            .map(|at| at.saturating_duration_since(now));
         [
             entity,
             mrp,
@@ -2138,6 +2247,7 @@ impl Runtime {
             lite,
             meters,
             begin,
+            discovery,
             Some(Duration::from_millis(250)),
         ]
         .into_iter()
@@ -2167,6 +2277,9 @@ impl Runtime {
                 }
                 for endpoint in &mut self.endpoints {
                     endpoint.entity.handle_frame(now, source, &bytes);
+                }
+                if let Some(discovery) = &mut self.discovery {
+                    discovery.handle_frame(now, source, &bytes);
                 }
             }
             Input::Ptp(source, bytes) => {
@@ -2338,6 +2451,12 @@ impl Runtime {
         let now = self.now();
         let since = self.elapsed();
         self.begin_unheld(now, since);
+        if let Some(discovery) = &mut self.discovery {
+            discovery.handle_timeout(now);
+        }
+        if self.discovery.as_mut().is_some_and(Discovery::take_changed) {
+            self.sync_network_devices();
+        }
         for endpoint in &mut self.endpoints {
             endpoint.entity.handle_timeout(now);
         }
@@ -2419,6 +2538,13 @@ impl Runtime {
                 }
             }
             handed = true;
+        }
+        // The daemon's controller, for the network devices: it reads only
+        // other computers' entities, so none of ours need hear it.
+        while let Some((destination, bytes)) =
+            self.discovery.as_mut().and_then(Discovery::poll_transmit)
+        {
+            let _ = self.avtp.send(destination, &bytes);
         }
         while let Some((destination, pdu)) = self.maap.as_mut().and_then(Maap::poll_transmit) {
             let _ = self.avtp.send(destination, &pdu);

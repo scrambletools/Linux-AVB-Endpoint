@@ -9,19 +9,25 @@
 //! every platform: the entities to run ([`config`]) and the models they
 //! show ([`model`]), what the daemon is doing ([`status`]), how loud its
 //! streams are ([`meters`]), where those files are ([`store`]), the
-//! daemon's user unit ([`unit`]), and how an entity's ID is made
-//! ([`entity_id`]). The `daemon` feature adds the daemon, for Linux.
+//! daemon's user unit ([`unit`]), how an entity's ID is made
+//! ([`entity_id`]), and the streams on other devices that get a device
+//! of their own here ([`devices`]). The `daemon` feature adds the
+//! daemon, for Linux.
 
 use atdecc::EntityId;
 use avb_net::MacAddress;
 
 pub mod config;
+pub mod connections;
+pub mod devices;
 pub mod meters;
 pub mod model;
 pub mod status;
 pub mod store;
 pub mod unit;
 
+#[cfg(feature = "daemon")]
+pub mod discovery;
 #[cfg(feature = "daemon")]
 pub mod gptp;
 #[cfg(feature = "daemon")]

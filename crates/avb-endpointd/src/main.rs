@@ -20,15 +20,16 @@ use avb_endpointd::config::{self, Config};
 use avb_endpointd::status::{EXIT_BAD_CONFIG, EXIT_NO_INTERFACE, EXIT_REFUSED, EXIT_USAGE};
 use avb_endpointd::{profile, runtime, status, store};
 
-const USAGE: &str = "usage: avb-endpointd --interface NAME [--config FILE]";
+mod tool;
+
+use tool::USAGE;
 
 fn main() -> ExitCode {
-    // Raw sockets come from avb-netraw, the one file granted CAP_NET_RAW.
-    #[cfg(target_os = "linux")]
-    let _ = avb_net::broker::use_helper("avb-netraw", &[Path::new("/usr/lib/avb-endpointd")]);
     let mut arguments = std::env::args().skip(1);
     let mut path: Option<PathBuf> = None;
     let mut interface: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut words: Vec<String> = Vec::new();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--config" => path = arguments.next().map(PathBuf::from),
@@ -37,6 +38,12 @@ fn main() -> ExitCode {
                 println!("avb-endpointd {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            word if command.is_some() && !word.starts_with("--") => words.push(word.to_owned()),
+            word if tool::COMMANDS.contains(&word) => command = Some(word.to_owned()),
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(EXIT_USAGE);
@@ -47,6 +54,12 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     };
+    if let Some(command) = command {
+        return tool::run(&command, &words, &interface, path);
+    }
+    // Raw sockets come from avb-netraw, the one file granted CAP_NET_RAW.
+    #[cfg(target_os = "linux")]
+    let _ = avb_net::broker::use_helper("avb-netraw", &[Path::new("/usr/lib/avb-endpointd")]);
     if !profile::nameable(&interface)
         || !avb_net::interfaces()
             .iter()
