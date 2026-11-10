@@ -1,0 +1,44 @@
+# Maintainer: Scramble Tools <https://github.com/scrambletools>
+pkgname=avb-endpointd
+pkgver=0.2.1
+pkgrel=1
+pkgdesc='Puts this computer on an AVB or Milan network, for any app'
+arch=('x86_64' 'aarch64')
+url='https://github.com/scrambletools/Linux-AVB-Endpoint'
+license=('MIT OR Apache-2.0')
+depends=('alsa-lib' 'ethtool' 'gcc-libs' 'glibc' 'gptpd' 'iproute2' 'libcap' 'libpipewire'
+    'pipewire' 'rtkit')
+makedepends=('cargo' 'clang')
+optdepends=('polkit: starting the link units without a password')
+install=avb-endpointd.install
+source=("Linux-AVB-Endpoint-$pkgver.tar.gz::$url/archive/refs/tags/avb-endpointd-v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir() {
+    echo "Linux-AVB-Endpoint-avb-endpointd-v$pkgver"
+}
+
+prepare() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p avb-endpointd --features daemon -p avb-netraw
+}
+
+check() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen -p avb-endpointd --features daemon
+}
+
+package() {
+    cd "$(_srcdir)"
+    scripts/dist-install.sh target/release "$pkgdir" /usr
+}

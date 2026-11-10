@@ -1,0 +1,10 @@
+# avb-netraw opens raw Ethernet sockets for the daemon and the apps'
+# controllers, the one program granted CAP_NET_RAW. systemd's pacman
+# hooks reload the units.
+post_install() {
+    setcap cap_net_raw+ep /usr/lib/avb-endpointd/avb-netraw
+}
+
+post_upgrade() {
+    post_install
+}
