@@ -286,6 +286,12 @@ computer on the network for any app (the user, 2026-11-09).
   plaa running its own entity at 0x70 does, the daemon holds that
   entity off the network, without a departing message, until the other
   departs or its advertisement runs out. The status marks it held.
+  Before its entities first advertise, the daemon asks for their IDs
+  with a targeted ENTITY_DISCOVER and waits 1.5 s, as an entity answers
+  within half a second, so it finds such a program before it says
+  anything itself: otherwise a listener bound to the other entity
+  would see its talker seem to restart. `scripts/smoke/held.sh` tests
+  it in a namespace.
 
 ### Models
 

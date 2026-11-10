@@ -63,7 +63,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p avb-endpointd --features daemon --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p avb-endpointd --features daemon
+cargo build -p avb-endpointd --features daemon && scripts/smoke/held.sh
 ```
+
+`scripts/smoke/held.sh` runs the daemon in a user and network namespace
+beside an older program's entity at the default's instance, and needs
+no root.
 
 To build against unpublished changes to the avb or gptp crates, a
 git-ignored `.cargo/avb-local.toml` can patch them to checkouts beside

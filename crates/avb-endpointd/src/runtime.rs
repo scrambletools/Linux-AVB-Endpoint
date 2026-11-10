@@ -196,6 +196,10 @@ const GPTPD_AGAIN: Duration = Duration::from_secs(120);
 /// How long after starting gptpd's unit the status says gptpd is
 /// starting, should it not answer before.
 const GPTPD_ANSWER: Duration = Duration::from_secs(10);
+/// How long the entities wait, having asked for their IDs with ADP, for
+/// another program here to answer before they advertise: an entity
+/// answers ENTITY_DISCOVER within half a second.
+const ASK_FIRST: Duration = Duration::from_millis(1500);
 /// How far the last Sync may stand from gptpd's mapping, in nanoseconds,
 /// before the daemon holds the time out of sync: far past what a clock's
 /// wander gives, well short of what a stream's presentation times bear.
@@ -961,6 +965,9 @@ pub struct Runtime {
     /// heard again: an older plaa running its own entity at the default's
     /// instance.
     held: HashMap<EntityId, Duration>,
+    /// When the entities begin advertising, having asked first whether
+    /// another program here advertises their IDs; `None` once they have.
+    begin_at: Option<Duration>,
     /// Whether an app asked for the meters when the daemon last looked,
     /// when that was, when it last wrote them and how many times, and each
     /// running stream's peaks in that write.
@@ -1300,6 +1307,7 @@ impl Runtime {
             _watch: config_watch,
             touched: false,
             held: HashMap::new(),
+            begin_at: None,
             meters_wanted: false,
             meters_looked: Clock::now(),
             meters_written: Clock::now(),
@@ -1325,9 +1333,7 @@ impl Runtime {
     pub fn run(mut self) -> io::Result<Exit> {
         let now = self.now();
         let since = self.elapsed();
-        for endpoint in &mut self.endpoints {
-            endpoint.begin(now);
-        }
+        self.ask_before_advertising(since);
         // Every endpoint takes part in class A on VLAN 2, declared once for
         // the port; talkers declare their streams once MAAP gives them
         // addresses.
@@ -1356,6 +1362,7 @@ impl Runtime {
                 self.release_held();
             }
             if (look || self.touched)
+                && self.begin_at.is_none()
                 && let Some(config) = self.changed_config()
             {
                 let file = self.file_name();
@@ -1610,6 +1617,36 @@ impl Runtime {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Asks, before any entity advertises, whether another program on this
+    /// computer already advertises one of their IDs, as an older plaa
+    /// does at the default's instance: an ENTITY_DISCOVER for each, which
+    /// an entity answers within half a second. Each answer from this
+    /// computer's address holds that entity off the network, and the rest
+    /// begin once the wait is over, so no controller or listener sees two
+    /// entities with one ID, nor the other's talker seem to restart.
+    fn ask_before_advertising(&mut self, since: Duration) {
+        let mut frame = [0u8; atdecc::adp::Adpdu::LEN];
+        for endpoint in &self.endpoints {
+            let discover = atdecc::adp::Adpdu::discover(endpoint.entity.entity_id());
+            if let Ok(length) = discover.encode(&mut frame) {
+                let _ = self.avtp.send(ADP_ACMP_MULTICAST, &frame[..length]);
+            }
+        }
+        self.begin_at = Some(since + ASK_FIRST);
+    }
+
+    /// Begins the entities no other program here answered for, once the
+    /// wait [`Self::ask_before_advertising`] started is over.
+    fn begin_unheld(&mut self, now: Instant, since: Duration) {
+        if self.begin_at.is_none_or(|at| at > since) {
+            return;
+        }
+        self.begin_at = None;
+        for endpoint in &mut self.endpoints {
+            endpoint.begin(now);
         }
     }
 
@@ -2093,12 +2130,14 @@ impl Runtime {
         let meters = self
             .meters_wanted
             .then(|| meters::EVERY.saturating_sub(self.meters_written.elapsed()));
+        let begin = self.begin_at.map(|at| at.saturating_sub(since));
         [
             entity,
             mrp,
             maap,
             lite,
             meters,
+            begin,
             Some(Duration::from_millis(250)),
         ]
         .into_iter()
@@ -2298,6 +2337,7 @@ impl Runtime {
     fn turn(&mut self) {
         let now = self.now();
         let since = self.elapsed();
+        self.begin_unheld(now, since);
         for endpoint in &mut self.endpoints {
             endpoint.entity.handle_timeout(now);
         }
