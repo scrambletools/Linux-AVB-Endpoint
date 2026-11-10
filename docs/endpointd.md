@@ -537,7 +537,7 @@ The link units stay as they are.
   (another person's) beside the daemon, and triib before and after its
   move.
 
-## Proposal: pinned destinations and sources
+## Proposal: network devices as sinks and sources
 
 Not decided: for the user to decide on.
 Nothing here changes how triib's features work: triib's entities,
@@ -547,42 +547,99 @@ The aim is that a media app needs nothing AVB-specific: plaa, mpv or a
 DAW plays into a PipeWire device and records from one, as it would
 speakers and a microphone. The default entity (step 2) is this
 computer on the network, which controllers route. This adds the other
-way round: the speakers and amp inputs a person pins, each a sink of
-its own, which connect when an app plays into them, and remote talkers
-as sources. PipeWire already works that way for other networks:
-AirPlay receivers, Snapcast and ROC appear as local sinks named for the
-remote device.
+way round: the network's speakers and amp inputs, each a sink of its
+own, which connect when an app plays into them, and remote talkers as
+sources. PipeWire already works that way for other networks: AirPlay
+receivers, Snapcast and ROC appear as local sinks named for the remote
+device.
 
-### Pins
+It has to serve a home with a few AVB speakers as well as a venue's
+Milan network (the user, 2026-11-10). At home there is nothing to set
+up: a new speaker shows in every app's output list by itself. Choosing
+which devices show is for networks large enough to need it.
 
-The interface's file lists them once, at the top level, edited under
-the lock like any change: `destination = ["<entity id>:<input>", ...]`
-for listener inputs and `source = ["<entity id>:<output>", ...]` for
-talker outputs, each index the descriptor's, counted from 0 as AEM
-counts it. A later `destinations = "all"` could list every compatible
-input, for small setups; pinned is the default, as a Milan network's
-every amp and speaker input in every desktop's sound menu would make a
-wrong pick too easy.
+### Which devices show
+
+Two modes for each interface, in its file:
+
+- **`destinations = "all"`, the default.** Every compatible listener
+  input the daemon finds gets a sink, once ADP announces its entity and
+  the daemon has read its model.
+  - An idle sink costs the network nothing: no talker, reservation or
+    bandwidth until an app plays into it. Ten speakers are ten PipeWire
+    nodes.
+  - **Used means remembered.** The first time an app plays into a
+    device, the daemon pins it (below). A device never used comes and
+    goes with the device; one used keeps its sink while it is off the
+    network.
+  - **Hidden:** a device on the file's `hide` list gets no sink, such
+    as a subwoofer feed or a mixer's aux input. Leaving out a few is
+    less work than choosing every one.
+- **`destinations = "pinned"`.** Only pinned devices get sinks, for a
+  network where every amp and speaker input in every desktop's sound
+  menu would make a wrong pick too easy. The status still lists the
+  devices found and not pinned, so a front end can say new ones are
+  there and offer to pin them.
+
+The daemon never changes the mode itself: switching to pinned as the
+list grows would make every sink vanish at once because a speaker was
+plugged in. A front end may suggest pinned mode past a dozen or so.
+
+`sources` takes the same two values for remote talkers, as recording
+devices, with the same rules.
+
+### The settings
+
+They sit at the top level of the interface's file, changed under the
+lock like any change, by a person, an app, the tool or the daemon:
+
+```toml
+# ~/.config/avb-endpointd/enp2s0.toml
+destinations = "all"            # or "pinned"
+sources = "all"
+
+[[hide]]
+entity = "0x001b92fffe0123ab"
+input = 0
+name = "Subwoofer"              # for reading; the ID and index count
+
+[[pin]]
+entity = "0x001b92fffe0456cd"
+input = 0
+name = "Living room"
+remembered = true               # pinned by the daemon on first use
+```
+
+- Entries are tables rather than `"<id>:<index>"` strings, so each
+  carries the device's name beside its ID. `input` is a listener's
+  input and `output` a talker's, each the descriptor's index, counted
+  from 0 as AEM counts it.
+- The daemon writes remembered pins into the file itself, merged by
+  entity and index, so a person sees them, and forgets a device by
+  removing its entry.
+- `name` is only for reading. The daemon fills it in and keeps it
+  current; no node name uses it.
 
 ### The pools
 
 The default entity carries them after its Playback output 0 and Listen
 input 0, with no devices of their own: `destination_talkers` outputs
 (4 when left out) and `source_listeners` inputs (4). Their sizes are
-settings, not one stream per pin, because streams are in the model
-ID's hash: a stream added at every pin would send every controller back
-to read the model each time a person pins or unpins.
+settings, not one stream per device, because streams are in the model
+ID's hash: a stream added for every device would send every controller
+back to read the model each time one comes, goes or is pinned.
 
-### Destination sinks and pinned sources
+### Destination sinks and sources
 
-- **One device per pin**, there while it is pinned, whether the remote
-  device is on the network or not, what plays into it dropped and the
-  status saying so, rather than vanishing and WirePlumber moving the app
-  to the desktop's speakers without a word:
+- **One device for each one shown:** in "all" mode while it is on the
+  network, and while it is pinned, whether on the network or not. What
+  plays into a pinned device that is off the network is dropped, and
+  the status says so, rather than the sink vanishing and WirePlumber
+  moving the app to the desktop's speakers without a word.
   - `node.name` is `avb-dest-<entity id>-in-<input>` or
-    `avb-src-<entity id>-out-<output>`, from the entity ID and the pin's
-    index, so WirePlumber's memory of each app's choice survives a
-    rename; the description is "<device name> <stream name>";
+    `avb-src-<entity id>-out-<output>`, from the entity ID and index,
+    so WirePlumber's memory of each app's choice survives a rename; the
+    description is "<device name> <stream name>";
   - `node.network = true`, and a low session priority, so WirePlumber
     never makes one the default and desktop sounds never reserve on the
     network; the default entity's own devices take the same;
@@ -592,59 +649,76 @@ to read the model each time a person pins or unpins.
   sink, paused or not, the daemon takes a talker from the pool, gives it
   a format the listener takes at its current rate (read over AECP,
   never changing the listener's rate), and sends ACMP's connect to the
-  listener as its own controller. A pinned source works the same way the
-  other round, binding a pool listener to the remote talker, which takes
+  listener as its own controller. A source works the same way the other
+  round, binding a pool listener to the remote talker, which takes
   nothing from anyone, as talker streams are multicast.
   - **Busy:** a listener bound to another talker, or acquired or locked
     by another controller (CONTROLLER_NOT_AUTHORIZED), is busy. The
     daemon doesn't take it over and doesn't retry in a loop; the status
     says so. Taking a listener over stays a deliberate act in a
-    controller, as plaa's Play is now.
+    controller, as plaa's Play is now. This holds in "all" mode too,
+    so a listener another controller routes is never taken.
   - **Releasing:** after the last app stream unlinks, and 30 s more, the
     daemon disconnects, so pauses, seeks and track changes don't cost an
     ACMP and MSRP round each. It disconnects only a binding it made that
     no one has changed since.
-  - **Running out:** a pool stream per connected pin, given back with
+  - **Running out:** a pool stream per connected device, given back with
     the binding. When the pool, the MAAP block (32 talkers) or the
-    bridge's bandwidth runs out, the pin's status says so.
+    bridge's bandwidth runs out, the device's status says so.
 - **The daemon's controller** has its own entity ID, `FF-FB` in the
   instance octets, beside triib's controller (`FF-FE`), triib-cli's
   (`FF-FD`) and plaa's (`FF-FC`). It advertises no entity, so nothing new
-  shows in triib's or Hive's lists, and it acts only on pins.
-- **Status:** each pin with the remote device's name and its state as a
-  plain value an app shows as it shows a talker's: `idle`, `connected`,
-  `busy`, `offline`, `no-talker` or `no-bandwidth`.
+  shows in triib's or Hive's lists, and it acts only on the devices it
+  shows, when an app plays into or records from one.
+- **Status:** each device found, with its name, whether it is shown,
+  pinned or hidden, and its state as a plain value an app shows as it
+  shows a talker's: `idle`, `connected`, `busy`, `offline`, `no-talker`
+  or `no-bandwidth`.
 
 ### The tool and the apps
 
-- **A neutral tool:** `avb-endpointd on|off`, `pin`, `unpin` and `list`,
-  with `--interface`, starts or stops the unit and edits the file under
-  the lock. No app is needed. Apps do the same through the library,
-  `config::edit` and `unit`.
+- **A neutral tool:** `avb-endpointd on|off`, `list`, `pin|unpin`,
+  `hide|show` and `mode all|pinned`, with `--interface`, taking a
+  device's name or entity ID. It starts or stops the unit and edits the
+  file under the lock. No app is needed. Apps do the same through the
+  library, `config::edit` and `unit`.
 - **plaa's** Network Audio becomes a front end: this computer on or off
-  the network, pinning, the pins' and gptpd's states from the status,
-  and its controller for browsing, details and the explicit takeover.
-  Its audio plays into a sink, and listens from a source, by node name.
+  the network, the devices found with hide and pin toggles, new devices
+  in pinned mode, the devices' and gptpd's states from the status, and
+  its controller for browsing, details and the explicit takeover. Its
+  audio plays into a sink, and listens from a source, by node name.
   Whether it also goes on playing on the computer's own speakers, as
   "Send what plays" does now, is plaa's own feature.
-- **triib** is unchanged. It may later offer pins as a front end too.
+- **triib** is unchanged. It may later offer the same as a front end.
+- **Without an AVB app,** a person has the tool or the file. A desktop's
+  sound settings can't hide a sink for good, so a small settings panel
+  of the daemon's own, or a desktop-neutral way in, may follow later.
 
 ### Order and decisions
 
-The daemon's controller, the pools and the pinned devices are a step of
-their own, after step 2 and before or after plaa's step, which by then
-plays into the default entity's devices.
+The daemon's controller, the pools and the network devices are a step
+of their own, after step 2 and before or after plaa's step, which by
+then plays into the default entity's devices.
 
 Decisions for the user:
 
 - whether to adopt it, and when;
-- pinned only, or `"all"` later too;
+- "all" as the default, with remembering on first use and `hide`, and
+  "pinned" for large networks;
+- in "all" mode, one sink per compatible input, or one per device on its
+  first compatible input, as a device with many inputs, such as an
+  interface, would fill the list;
+- whether "all" shows only entities that listen and don't talk, as most
+  speakers and amps do, leaving out interfaces, mixers and other
+  computers, which also talk;
+- whether `sources` defaults to "all" too, which would show other
+  computers' outputs as recording devices;
 - the 30 s release;
 - pools of 4;
 - `FF-FB` for the daemon's controller.
 
-Later: group sinks, several pinned listeners on one multicast talker
-playing the same audio, as AVB does natively.
+Later: group sinks, several listeners on one multicast talker playing
+the same audio, as AVB does natively; a settings panel.
 
 ## Plan
 
