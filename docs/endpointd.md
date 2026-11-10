@@ -543,9 +543,14 @@ The link units stay as they are.
   (another person's) beside the daemon, and triib before and after its
   move.
 
-## Proposal: network devices as sinks and sources
+## Network devices as sinks and sources
 
-Not decided: for the user to decide on.
+Adopted (2026-11-10), as the step after step 2, for avb-endpointd
+0.3.0. Built so far, on the network-devices branch: the file's modes,
+pins and hidden streams, the status's list of streams found, the
+tool, and the daemon's controller finding the other devices' streams.
+Still to build: the devices themselves, the pools, connecting and
+releasing, and remembering on first use.
 Nothing here changes how triib's features work: triib's entities,
 devices and controller go on as they are.
 
@@ -777,12 +782,20 @@ Settled, with plaa's review (the user, 2026-11-10):
 - 2, 8, 16 and 32 channels only, each device as wide as the widest of
   those its remote stream accepts, made once, with ports AUX0 to AUXn.
 
-Decisions for the user:
+Settled overnight on the user's go-ahead, for the user to revisit
+(2026-11-10):
 
-- whether to adopt it, and when;
+- adopted, as the step after step 2, released as avb-endpointd 0.3.0;
 - the 30 s release;
 - pools of 4;
 - `FF-FB` for the daemon's controller.
+
+In 0.3.0 the status's types are `#[non_exhaustive]`, each with a
+`Default`, so later fields are minor releases: apps build them with
+`default()` and set fields, and match `Setup`, `Blocked` and
+`DeviceState` with a `_` arm. An avb-endpointd before 0.3.0 that
+writes the file back drops its pins and hidden streams, which it does
+not know.
 
 Later: group sinks, several listeners on one multicast talker playing
 the same audio, as AVB does natively; a settings panel.

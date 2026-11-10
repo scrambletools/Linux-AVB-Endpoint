@@ -27,6 +27,29 @@ The protocol and stream crates they build on, `atdecc`, `avb-net`,
 and gPTP from gptpd, in
 [scrambletools/gptp](https://github.com/scrambletools/gptp).
 
+## Using it
+
+An app such as plaa or triib turns this computer on and off the
+network. Without one, the daemon's own command does:
+
+```sh
+avb-endpointd on --interface enp2s0      # start it now and at each login
+avb-endpointd list --interface enp2s0    # speakers and microphones found
+avb-endpointd off --interface enp2s0
+```
+
+Each speaker or amp input found on the network gets a playback device
+of its own, which any app plays into. `hide` leaves one out, `pin`
+keeps one while it is off the network, and `mode destinations pinned`
+shows only those pinned, for a large network. A microphone or other
+talker gets a recording device once pinned, or with
+`mode sources all`. `list` names each by name or by
+`<entity id>:in<n>` and `<entity id>:out<n>`, and the others take
+either.
+On this branch the devices appear but do not yet connect to the
+network: connecting and releasing are still to build
+([docs/endpointd.md](docs/endpointd.md)).
+
 ## The files
 
 - `~/.config/avb-endpointd/<interface>.toml`: the entities to run,
@@ -68,8 +91,9 @@ cargo build -p avb-endpointd --features daemon && scripts/smoke/held.sh
 
 The scripts in `scripts/smoke` run the daemon in a user and network
 namespace on dummy interfaces, and need no root: `held.sh` beside an
-older program's entity at the default's instance, and `instances.sh`
-on two interfaces at once, with a second daemon refused.
+older program's entity at the default's instance, `instances.sh` on
+two interfaces at once, with a second daemon refused, and `devices.sh`
+with two daemons on a veth pair finding each other's streams.
 
 To build against unpublished changes to the avb or gptp crates, a
 git-ignored `.cargo/avb-local.toml` can patch them to checkouts beside
