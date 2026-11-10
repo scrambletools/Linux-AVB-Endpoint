@@ -333,6 +333,9 @@ mod imp {
                 // Its audio goes over the network, PipeWire's
                 // PW_KEY_NODE_NETWORK.
                 "node.network" => "true",
+                // The lowest, so WirePlumber never makes one the default
+                // and the desktop's own sounds never go out on the network.
+                *pw::keys::PRIORITY_SESSION => "0",
             },
         )
         .map_err(error)?;

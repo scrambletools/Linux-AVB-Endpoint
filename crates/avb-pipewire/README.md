@@ -17,7 +17,8 @@ where avb-endpointd uses it.
   rate, `VirtualAudio::rate`, normally 48 kHz, whatever rate the stream
   runs at; the stream's side converts between the two.
 - Each is marked `node.virtual` and `node.network`, so the desktop
-  treats it as a network device.
+  treats it as a network device, with the lowest session priority, so
+  WirePlumber never makes one the default output or input.
 - It builds everywhere, but devices exist only on Linux; elsewhere
   `start` returns an error.
 
