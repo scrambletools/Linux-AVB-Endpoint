@@ -510,6 +510,13 @@ mod tests {
             again = take_lock(&one).unwrap();
         }
         assert!(again.is_some());
+        drop(again);
+        // The runtime folder is the person's own: the test leaves nothing
+        // in it.
+        let dir = crate::store::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        for name in [&one, &other] {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.lock")));
+        }
     }
 
     /// A process that ended but was not yet collected, a zombie, runs no
