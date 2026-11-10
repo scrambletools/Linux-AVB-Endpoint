@@ -6,7 +6,7 @@
 //! reads no entity advertised from this computer's address, as this
 //! computer's own entities get no network device.
 
-use atdecc::controller::{Config, Controller, Event};
+use atdecc::controller::{CommandId, Config, Controller, Event, Outcome};
 use atdecc::descriptor::DescriptorType;
 use atdecc::{EntityId, Instant};
 use avb_net::MacAddress;
@@ -23,6 +23,9 @@ pub struct Discovery {
     mac: MacAddress,
     changed: bool,
     buffer: Vec<u8>,
+    /// The commands the daemon asked for that finished, and whether
+    /// each was done.
+    finished: Vec<(CommandId, bool)>,
 }
 
 impl Discovery {
@@ -52,6 +55,7 @@ impl Discovery {
             mac,
             changed: true,
             buffer: vec![0; 1500],
+            finished: Vec::new(),
         }
     }
 
@@ -79,6 +83,33 @@ impl Discovery {
         ))
     }
 
+    /// The controller's entity ID.
+    pub fn entity_id(&self) -> EntityId {
+        self.controller.entity_id()
+    }
+
+    /// Binds a listener's stream input to a talker's output, as its
+    /// controller (CONNECT_RX, which Milan calls BIND_RX).
+    pub fn connect(
+        &mut self,
+        now: Instant,
+        talker: (EntityId, u16),
+        listener: (EntityId, u16),
+    ) -> CommandId {
+        self.controller.connect(now, talker, listener)
+    }
+
+    /// Unbinds a listener's stream input (DISCONNECT_RX).
+    pub fn disconnect(&mut self, now: Instant, listener: (EntityId, u16)) -> CommandId {
+        self.controller.disconnect(now, listener)
+    }
+
+    /// The commands that finished since the last call, and whether each
+    /// was done.
+    pub fn take_finished(&mut self) -> Vec<(CommandId, bool)> {
+        std::mem::take(&mut self.finished)
+    }
+
     /// Whether an entity came, went or changed since the last call.
     pub fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -93,6 +124,9 @@ impl Discovery {
                 | Event::EntityEnumerated(_)
                 | Event::EntityModelChanged(_)
                 | Event::EnumerationFailed(..) => self.changed = true,
+                Event::CommandFinished(command, outcome) => {
+                    self.finished.push((command, outcome == Outcome::Done));
+                }
                 _ => {}
             }
         }
@@ -110,13 +144,16 @@ impl Discovery {
             let Some(model) = self.controller.model(id) else {
                 continue;
             };
+            // Another computer's daemon: its pool streams are no speaker
+            // or microphone, only its default entity's own are.
+            let daemon = crate::is_device_model(entity.adp.entity_model_id);
             let device = model
                 .entity_name()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("0x{:016x}", id.0));
             for input in [true, false] {
                 for descriptor in model.streams(input) {
-                    if descriptor.is_media_clock() {
+                    if descriptor.is_media_clock() || (daemon && is_pool(descriptor.object_name)) {
                         continue;
                     }
                     let index = descriptor.index;
@@ -130,11 +167,11 @@ impl Discovery {
                     } else {
                         DescriptorType::STREAM_OUTPUT
                     };
-                    let current = model
+                    let format = model
                         .stream_info(descriptor_type, index)
                         .map(|info| info.stream_format)
-                        .unwrap_or(descriptor.current_format)
-                        .channels();
+                        .unwrap_or(descriptor.current_format);
+                    let current = format.channels();
                     let mut accepted: Vec<u16> = descriptor
                         .formats()
                         .filter_map(|format| format.channels())
@@ -156,6 +193,7 @@ impl Discovery {
                         name,
                         accepted,
                         current,
+                        format: Some(format),
                         busy,
                     });
                 }
@@ -171,6 +209,15 @@ impl Discovery {
     }
 }
 
+/// Whether a stream of another computer's daemon is one of its default
+/// entity's pool streams, by the names the daemon gives them.
+fn is_pool(name: &str) -> bool {
+    ["Destination ", "Source "].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|number| number.parse::<u16>().is_ok())
+    })
+}
+
 /// Whether `entity` has an ID [`crate::entity_id`] makes from `mac`.
 fn is_from(entity: EntityId, mac: MacAddress) -> bool {
     let bytes = entity.0.to_be_bytes();
@@ -180,6 +227,12 @@ fn is_from(entity: EntityId, mac: MacAddress) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_daemons_pool_streams_are_told_apart() {
+        assert!(is_pool("Destination 1") && is_pool("Source 4"));
+        assert!(!is_pool("Playback") && !is_pool("Source") && !is_pool("Source A"));
+    }
 
     #[test]
     fn this_computers_entity_ids_are_told_apart() {

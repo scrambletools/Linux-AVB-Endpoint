@@ -12,7 +12,7 @@
 //! - It disconnects only what it connected and no one changed since: a
 //!   remote stream that went busy, or off the network, it forgets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::devices::{DeviceState, RemoteStream, Way};
@@ -65,6 +65,9 @@ pub struct Connections {
     links: BTreeMap<RemoteStream, Link>,
     /// Devices in use that found no pool stream free, this turn.
     starved: Vec<RemoteStream>,
+    /// Devices whose connect failed, not tried again until no app uses
+    /// them.
+    refused: BTreeSet<RemoteStream>,
 }
 
 impl Connections {
@@ -76,6 +79,7 @@ impl Connections {
             listeners,
             links: BTreeMap::new(),
             starved: Vec::new(),
+            refused: BTreeSet::new(),
         }
     }
 
@@ -90,6 +94,11 @@ impl Connections {
             seen.iter()
                 .find(|device| device.stream == *stream)
                 .is_some_and(|device| device.remote == DeviceState::Idle)
+        });
+        // A device no app uses may be tried again once one does.
+        self.refused.retain(|stream| {
+            seen.iter()
+                .any(|device| device.stream == *stream && device.in_use)
         });
         for device in seen {
             match self.links.get_mut(&device.stream) {
@@ -107,7 +116,10 @@ impl Connections {
                         }
                     }
                 }
-                None if device.in_use && device.remote == DeviceState::Idle => {
+                None if device.in_use
+                    && device.remote == DeviceState::Idle
+                    && !self.refused.contains(&device.stream) =>
+                {
                     match self.free_pool(device.stream.way) {
                         Some(pool) => {
                             self.links.insert(
@@ -142,6 +154,7 @@ impl Connections {
             }
         } else {
             self.links.remove(stream);
+            self.refused.insert(*stream);
         }
     }
 
@@ -315,10 +328,19 @@ mod tests {
             None,
             "refused, its pool stream freed"
         );
-        // Gone from the network: forgotten.
-        connections.update(secs(7), &[seen(main, true, DeviceState::Idle)]);
+        // Refused, it is not tried again while the app goes on, but is
+        // once the app stopped and plays again.
+        assert!(
+            connections
+                .update(secs(7), &[seen(main, true, DeviceState::Idle)])
+                .is_empty()
+        );
+        connections.update(secs(8), &[seen(main, false, DeviceState::Idle)]);
+        let actions = connections.update(secs(9), &[seen(main, true, DeviceState::Idle)]);
+        assert_eq!(actions.len(), 1);
         connections.connected(&main, true);
-        assert!(connections.update(secs(8), &[]).is_empty());
+        // Gone from the network: forgotten.
+        assert!(connections.update(secs(10), &[]).is_empty());
         assert_eq!(connections.pool(&main), None);
     }
 }

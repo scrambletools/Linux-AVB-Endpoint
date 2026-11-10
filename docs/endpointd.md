@@ -546,11 +546,28 @@ The link units stay as they are.
 ## Network devices as sinks and sources
 
 Adopted (2026-11-10), as the step after step 2, for avb-endpointd
-0.3.0. Built so far, on the network-devices branch: the file's modes,
-pins and hidden streams, the status's list of streams found, the
-tool, and the daemon's controller finding the other devices' streams.
-Still to build: the devices themselves, the pools, connecting and
-releasing, and remembering on first use.
+0.3.0. Built so far, on the network-devices branch:
+
+- the file's modes, pins and hidden streams, and the tool;
+- the daemon's controller finding the other devices' streams, and
+  the status's list of them;
+- a device for each one shown, as wide as its stream takes;
+- the default entity's pools, and for destinations, connecting a
+  pool talker as an app plays into the device, at the listener's
+  current format, releasing it 30 s after, and remembering the
+  device as pinned.
+
+Still to build: sources (binding a pool listener to a remote talker),
+setting a listener whose current channel count is none of the four
+before connecting (until then it is refused), and the bench test
+with real speakers. One gap waits on avb-stream: it takes a shared
+buffer only of the stream's own channels, so a device wider than its
+stream's current format, as the channel rule makes one, cannot feed
+the pool talker until avb-stream lets a wider buffer give the
+stream's first channels. plaa has written that in avb-stream
+(2026-11-10), uncommitted until the user releases it. `scripts/smoke/connect.sh` tests connecting, with
+a PipeWire of its own, in a namespace, where no audio flows for want
+of gPTP.
 Nothing here changes how triib's features work: triib's entities,
 devices and controller go on as they are.
 

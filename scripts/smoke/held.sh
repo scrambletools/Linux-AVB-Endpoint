@@ -26,7 +26,10 @@ bin=$2
 work=$3
 mkdir -p "$work/stub" "$work/data/avb-endpointd/models" "$work/config/avb-endpointd" "$work/run"
 printf '#!/bin/sh\nexit 0\n' >"$work/stub/systemctl"
-chmod +x "$work/stub/systemctl"
+# No real-time threads: RealtimeKit, which avb-stream asks through
+# busctl, would raise a stream thread over the computer's own audio.
+printf '#!/bin/sh\nexit 1\n' >"$work/stub/busctl"
+chmod +x "$work/stub/systemctl" "$work/stub/busctl"
 cp "$root"/packaging/linux/models/* "$work/data/avb-endpointd/models/"
 printf '[[endpoint]]\ninstance = 3\nname = "Mine"\n' >"$work/config/avb-endpointd/d0.toml"
 mount -t sysfs sysfs /sys

@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant as Clock};
 
 use atdecc::acmp::AcmpFlags;
+use atdecc::controller::CommandId;
 use atdecc::entity::{
     ClockQuality, EndpointModel, Entity, EntityEvent, InputBinding, InputReservation,
     OutputReservation, StreamModel, UNADDRESSED,
@@ -27,7 +28,7 @@ use avb_mrp::msrp::{self, ListenerState, TalkerDeclaration, TalkerFailure};
 use avb_mrp::sharing::{self as sharing_protocol, Hello, Mode, Notice, Refusal, Request};
 use avb_net::Socket;
 use avb_net::stream::FrameSender;
-use avb_stream::audio::{Sink, Source};
+use avb_stream::audio::{SharedBuffer, Sink, Source};
 use avb_stream::formats;
 use avb_stream::{
     GroupConfig, GroupListener, GroupStream, GroupTalker, ListenerConfig, ListenerGroup,
@@ -40,6 +41,7 @@ use crate::config::{
     Config, Direction, EndpointConfig, LiteChoice, MOST_STREAMS, SrClass, StreamConfig,
     binding_text,
 };
+use crate::connections::{Action, Connections, RELEASE, Seen};
 use crate::devices::{self, FoundStream, RemoteStream, Way};
 use crate::discovery::Discovery;
 use crate::gptp;
@@ -282,6 +284,9 @@ struct OutputState {
     talker: Option<GroupTalker>,
     /// The virtual audio device apps play into for it, where it has one.
     device: Option<VirtualDevice>,
+    /// For a pool talker, the network device whose audio it sends while
+    /// the daemon connects it to that device's listener.
+    pool_source: Option<SharedBuffer>,
     /// Its test tones, where it sends them.
     tones: Option<signal::Tones>,
     /// Its place in the MAAP block, kept while it runs, so endpoints
@@ -384,9 +389,12 @@ struct Endpoint {
     entity: Entity,
     /// It shows the generic model.
     generic_model: bool,
-    /// Its streams as configured, and where each output's and input's is
-    /// among them.
+    /// Its streams as configured, then the default entity's pool streams,
+    /// which the file does not list, and where each output's and input's
+    /// is among them.
     streams: Vec<StreamConfig>,
+    /// How many of the streams the file lists, ahead of the pool's.
+    configured: usize,
     out_streams: Vec<usize>,
     in_streams: Vec<usize>,
     /// The thread every output sends from, and the one every input takes
@@ -508,11 +516,16 @@ impl Endpoint {
         mac: MacAddress,
         interface: &str,
         clock: ClockIdentity,
+        pools: (u8, u8),
     ) -> Self {
         let (identity, generic) = identity_of(&config.name, config.model.as_deref());
-        Self::with_identity(config, identity, generic, instance, mac, interface, clock)
+        Self::with_identity(
+            config, identity, generic, instance, mac, interface, clock, pools,
+        )
     }
 
+    // The entry, its identity, where it runs, and the default's pools.
+    #[allow(clippy::too_many_arguments)]
     fn with_identity(
         config: EndpointConfig,
         identity: Identity,
@@ -521,8 +534,21 @@ impl Endpoint {
         mac: MacAddress,
         interface: &str,
         clock: ClockIdentity,
+        pools: (u8, u8),
     ) -> Self {
-        let streams = config.stream_configs();
+        let mut streams = config.stream_configs();
+        let configured = streams.len();
+        // The default entity carries the pools after its own streams: a
+        // talker for each destination an app plays into at once, and a
+        // listener for each source an app records from.
+        if config.is_default {
+            streams.extend(
+                (1..=usize::from(pools.0)).map(|number| StreamConfig::pool(Direction::Out, number)),
+            );
+            streams.extend(
+                (1..=usize::from(pools.1)).map(|number| StreamConfig::pool(Direction::In, number)),
+            );
+        }
         let place_of = |direction| {
             streams
                 .iter()
@@ -693,6 +719,7 @@ impl Endpoint {
             outputs: out_streams.iter().map(|_| OutputState::default()).collect(),
             inputs: in_streams.iter().map(|_| InputState::default()).collect(),
             streams,
+            configured,
             out_streams,
             in_streams,
             group: Weak::new(),
@@ -702,6 +729,16 @@ impl Endpoint {
             clock_locks: 1,
             clock_unlocks: 0,
         }
+    }
+
+    /// Its output index of pool talker `pool`, counted from 0.
+    fn pool_output(&self, pool: u16) -> Option<u16> {
+        self.out_streams
+            .iter()
+            .enumerate()
+            .filter(|(_, place)| self.streams[**place].is_pool())
+            .nth(usize::from(pool))
+            .map(|(at, _)| at as u16)
     }
 
     /// The media clock its talkers follow: its clock source's, none for
@@ -977,6 +1014,12 @@ pub struct Runtime {
     /// shown, each with its channels.
     found: Vec<FoundStream>,
     network_devices: HashMap<RemoteStream, (u16, VirtualDevice)>,
+    /// Which network devices are connected to the pool, the controller's
+    /// connects still to answer, and the sequence of the AEM commands
+    /// the daemon gives its own entity.
+    connections: Connections,
+    connecting: HashMap<CommandId, (RemoteStream, Out)>,
+    own_sequence: u16,
     /// Whether an app asked for the meters when the daemon last looked,
     /// when that was, when it last wrote them and how many times, and each
     /// running stream's peaks in that write.
@@ -1210,6 +1253,7 @@ impl Runtime {
             mac.0[0], mac.0[1], mac.0[2], 0xff, 0xfe, mac.0[3], mac.0[4], mac.0[5],
         ]));
         let mut used = Vec::new();
+        let pools = (config.talker_pool(), config.listener_pool());
         let endpoints: Vec<Endpoint> = config
             .endpoints
             .iter()
@@ -1224,8 +1268,14 @@ impl Runtime {
                     return None;
                 }
                 used.push(instance);
-                let mut made =
-                    Endpoint::new(endpoint.clone(), instance, mac, &interface, own_clock);
+                let mut made = Endpoint::new(
+                    endpoint.clone(),
+                    instance,
+                    mac,
+                    &interface,
+                    own_clock,
+                    pools,
+                );
                 made.place = place;
                 Some(made)
             })
@@ -1320,6 +1370,9 @@ impl Runtime {
             discovery: None,
             found: Vec::new(),
             network_devices: HashMap::new(),
+            connections: Connections::new(u16::from(pools.0), u16::from(pools.1)),
+            connecting: HashMap::new(),
+            own_sequence: 0,
             meters_wanted: false,
             meters_looked: Clock::now(),
             meters_written: Clock::now(),
@@ -1465,6 +1518,7 @@ impl Runtime {
                     mac,
                     &self.interface,
                     self.own_clock,
+                    (config.talker_pool(), config.listener_pool()),
                 );
                 made.place = place;
                 made
@@ -1658,6 +1712,185 @@ impl Runtime {
             self.discovery = None;
         }
         self.sync_network_devices();
+    }
+
+    /// Connects the destinations apps play into to the pool's talkers, and
+    /// lets go of those they stopped using, as [`Connections`] decides;
+    /// then takes in how the controller's connects went.
+    fn drive_connections(&mut self) {
+        if self.discovery.is_none() {
+            return;
+        }
+        let now = self.now();
+        let since = self.elapsed();
+        let seen: Vec<Seen> = devices::statuses(&self.config, &self.found)
+            .into_iter()
+            .filter(|status| status.shown && status.way == Way::Destination)
+            .filter_map(|status| {
+                let stream = status.stream()?;
+                let in_use = self
+                    .network_devices
+                    .get(&stream)
+                    .is_some_and(|(_, device)| device.in_use());
+                Some(Seen {
+                    stream,
+                    in_use,
+                    remote: status.state,
+                })
+            })
+            .collect();
+        for action in self.connections.update(since, &seen) {
+            match action {
+                Action::Connect { stream, pool } => self.connect_destination(now, stream, pool),
+                Action::Disconnect { stream, pool } => {
+                    self.disconnect_destination(now, stream, pool);
+                }
+            }
+        }
+        let finished = self
+            .discovery
+            .as_mut()
+            .map(Discovery::take_finished)
+            .unwrap_or_default();
+        for (command, done) in finished {
+            let Some((stream, out)) = self.connecting.remove(&command) else {
+                continue;
+            };
+            self.connections.connected(&stream, done);
+            let name = self.stream_name(&stream);
+            if done {
+                log(format!("{name}: connected"));
+                // Used once, it stays: remembered, it keeps its device off
+                // the network.
+                if !self.config.is_pinned(&stream) {
+                    self.write_back(|config| {
+                        config.pin(stream, &name, true);
+                    });
+                }
+            } else {
+                log(format!("{name}: could not connect"));
+                if out.0 < self.endpoints.len() {
+                    self.output_mut(out).pool_source = None;
+                }
+            }
+        }
+    }
+
+    /// A stream on another device's name, as found.
+    fn stream_name(&self, stream: &RemoteStream) -> String {
+        self.found
+            .iter()
+            .find(|found| found.stream == *stream)
+            .map_or_else(|| stream.to_string(), |found| found.name.clone())
+    }
+
+    /// Connects destination `stream` to pool talker `pool`: the talker
+    /// takes the listener's current format and sends what apps play into
+    /// the device, and the controller binds the listener to it.
+    fn connect_destination(&mut self, now: Instant, stream: RemoteStream, pool: u16) {
+        let name = self.stream_name(&stream);
+        let format = self
+            .found
+            .iter()
+            .find(|found| found.stream == stream)
+            .and_then(|found| found.format);
+        let index = self
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.config.is_default);
+        let output = index.and_then(|index| self.endpoints[index].pool_output(pool));
+        let shared = self
+            .network_devices
+            .get(&stream)
+            .map(|(_, device)| device.shared());
+        let (Some(index), Some(output), Some(format), Some(shared)) =
+            (index, output, format, shared)
+        else {
+            log(format!(
+                "{name}: no pool talker or format to connect it with"
+            ));
+            self.connections.connected(&stream, false);
+            return;
+        };
+        let offered = self.endpoints[index]
+            .entity
+            .model()
+            .outputs
+            .get(usize::from(output))
+            .is_some_and(|model| model.formats.iter().any(|offered| offered.admits(format)));
+        if !offered {
+            log(format!(
+                "{name}: its format {:#018x} is not one the pool sends",
+                format.0
+            ));
+            self.connections.connected(&stream, false);
+            return;
+        }
+        self.set_own_output_format(index, output, format);
+        let out = Out(index, output);
+        self.output_mut(out).pool_source = Some(shared);
+        if self.output(out).talker.is_some() {
+            self.start_talker(out);
+        }
+        let talker = (self.endpoints[index].entity.entity_id(), output);
+        let Some(discovery) = &mut self.discovery else {
+            return;
+        };
+        let command = discovery.connect(now, talker, (stream.entity, stream.index));
+        self.connecting.insert(command, (stream, out));
+        log(format!(
+            "{name}: connecting to destination talker {}",
+            pool + 1
+        ));
+    }
+
+    /// Lets go of destination `stream`: the controller unbinds its
+    /// listener, and pool talker `pool` goes back to silence.
+    fn disconnect_destination(&mut self, now: Instant, stream: RemoteStream, pool: u16) {
+        if let Some(index) = self
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.config.is_default)
+            && let Some(output) = self.endpoints[index].pool_output(pool)
+        {
+            self.output_mut(Out(index, output)).pool_source = None;
+        }
+        if let Some(discovery) = &mut self.discovery {
+            discovery.disconnect(now, (stream.entity, stream.index));
+        }
+        log(format!(
+            "{}: released, unused for {} s",
+            self.stream_name(&stream),
+            RELEASE.as_secs()
+        ));
+    }
+
+    /// Sets output `output` of entity `index` to `format`, as a
+    /// controller's SET_STREAM_FORMAT would, given to the entity here.
+    fn set_own_output_format(&mut self, index: usize, output: u16, format: StreamFormat) {
+        let target = self.endpoints[index].entity.entity_id();
+        let controller = self
+            .discovery
+            .as_ref()
+            .map_or(EntityId(0), Discovery::entity_id);
+        self.own_sequence = self.own_sequence.wrapping_add(1);
+        let set = atdecc::aem::SetStreamFormat {
+            descriptor_type: atdecc::DescriptorType::STREAM_OUTPUT,
+            index: output,
+            format,
+        };
+        let addressing = atdecc::aem::Addressing {
+            target,
+            controller,
+            sequence_id: self.own_sequence,
+        };
+        let mut frame = [0u8; 128];
+        if let Ok(length) = set.encode(addressing, &mut frame) {
+            let now = self.now();
+            self.endpoints[index]
+                .entity
+                .handle_frame(now, self.mac, &frame[..length]);
+        }
     }
 
     /// Gives each stream on another device the file shows a device of its
@@ -1955,6 +2188,8 @@ impl Runtime {
                 .input_binding(at as u16)
                 .map(|binding| binding_text(binding.talker, binding.talker_unique_id));
         }
+        // The pool's streams are the daemon's, not the file's.
+        streams.truncate(endpoint.configured);
         let instance = endpoint.config.instance_at(endpoint.place);
         let place = endpoint.place;
         let keep = |entry: &mut EndpointConfig| {
@@ -2061,7 +2296,18 @@ impl Runtime {
             setup,
             sharers: self.sharers.statuses(),
             endpoints,
-            devices: devices::statuses(&self.config, &self.found),
+            devices: devices::statuses(&self.config, &self.found)
+                .into_iter()
+                .map(|mut status| {
+                    if let Some(state) = status
+                        .stream()
+                        .and_then(|stream| self.connections.state(&stream))
+                    {
+                        status.state = state;
+                    }
+                    status
+                })
+                .collect(),
         };
         let _ = crate::store::save(&path, &status);
     }
@@ -2457,6 +2703,7 @@ impl Runtime {
         if self.discovery.as_mut().is_some_and(Discovery::take_changed) {
             self.sync_network_devices();
         }
+        self.drive_connections();
         for endpoint in &mut self.endpoints {
             endpoint.entity.handle_timeout(now);
         }
@@ -3266,10 +3513,11 @@ impl Runtime {
         let lite = self.lite.is_some();
         let name = self.out_name(out);
         let format = stream.current_format;
-        let source = match &self.output(out).device {
-            Some(device) => Source::Shared(device.shared()),
-            None if endpoint.out_config(out.1).clock => Source::Silence,
-            None => endpoint.out_config(out.1).source(),
+        let source = match (&self.output(out).device, &self.output(out).pool_source) {
+            (Some(device), _) => Source::Shared(device.shared()),
+            (None, Some(buffer)) => Source::Shared(buffer.clone()),
+            (None, None) if endpoint.out_config(out.1).clock => Source::Silence,
+            (None, None) => endpoint.out_config(out.1).source(),
         };
         let Some(media) = avb_stream::media::Media::of(format) else {
             log(format!(
@@ -5728,7 +5976,7 @@ mod tests {
             ..EndpointConfig::new("Studio", Some(4))
         };
         let mac = MacAddress([0xf0, 0xa7, 0x31, 0xf4, 0x0f, 0x14]);
-        Endpoint::new(config, 4, mac, "enp2s0", ClockIdentity(1))
+        Endpoint::new(config, 4, mac, "enp2s0", ClockIdentity(1), (0, 0))
     }
 
     fn stream(direction: Direction, channels: u16) -> StreamConfig {
@@ -5921,7 +6169,7 @@ mod tests {
         let read: Config = toml::from_str(&text).expect("reads");
         assert_eq!(read.endpoints[0], config);
         let mac = MacAddress([0xf0, 0xa7, 0x31, 0xf4, 0x0f, 0x14]);
-        let mut entity = Endpoint::new(config, 4, mac, "enp2s0", ClockIdentity(1));
+        let mut entity = Endpoint::new(config, 4, mac, "enp2s0", ClockIdentity(1), (0, 0));
         assert!(entity.entity.input_mappings_are_default(0));
         entity.begin(Instant::from_nanos(0));
         assert!(!entity.entity.input_mappings_are_default(0));
@@ -5983,6 +6231,7 @@ mod tests {
                 mac,
                 "enp2s0",
                 ClockIdentity(1),
+                (0, 0),
             )
             .entity
             .model()
@@ -6056,6 +6305,7 @@ mod tests {
             mac,
             "enp2s0",
             ClockIdentity(1),
+            (0, 0),
         );
         let model = talker.entity.model();
         assert!(is_device_model(model.entity_model_id));

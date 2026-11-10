@@ -203,6 +203,9 @@ pub struct FoundStream {
     pub accepted: Vec<u16>,
     /// The channel count of its current format, where known.
     pub current: Option<u16>,
+    /// Its current format, where known, which a pool talker connecting
+    /// to it takes.
+    pub format: Option<atdecc::stream_format::StreamFormat>,
     /// A listener input bound to a talker that is not the daemon's, or
     /// acquired or locked by another controller.
     pub busy: bool,
@@ -297,6 +300,7 @@ mod tests {
             name: name.into(),
             accepted: accepted.to_vec(),
             current: accepted.first().copied(),
+            format: None,
             busy: false,
         }
     }

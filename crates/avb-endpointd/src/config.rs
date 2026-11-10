@@ -115,7 +115,7 @@ impl Shown {
 }
 
 /// The talkers or listeners a pool keeps when the file gives no number.
-pub const POOL: u8 = 4;
+pub const POOL_SIZE: u8 = 4;
 
 /// A stream on another device as the file lists it, to pin or to hide:
 /// its entity, `input` for a destination or `output` for a source, and
@@ -333,6 +333,30 @@ pub fn mappings_text(pairs: impl IntoIterator<Item = (u16, u16)>, channels: u16)
 }
 
 impl StreamConfig {
+    /// One of the default entity's pool streams, the `number`th of its
+    /// way counted from 1: of 32 channels, its formats taking 2, 8 and 16
+    /// as well, and silent until the daemon connects it to a network
+    /// device.
+    pub fn pool(direction: Direction, number: usize) -> Self {
+        let name = match direction {
+            Direction::Out => format!("Destination {number}"),
+            Direction::In => format!("Source {number}"),
+        };
+        StreamConfig {
+            name,
+            channels: 32,
+            audio: Some(POOL_STREAM.into()),
+            ..StreamConfig::new(direction)
+        }
+    }
+
+    /// Whether it is one of the default entity's pool streams, which the
+    /// daemon adds for the network devices rather than the file listing
+    /// it.
+    pub fn is_pool(&self) -> bool {
+        self.audio.as_deref() == Some(POOL_STREAM)
+    }
+
     /// Whether its audio is its own virtual device; never a media
     /// clock's.
     pub fn is_virtual(&self) -> bool {
@@ -364,6 +388,9 @@ impl StreamConfig {
 
 /// The audio of a stream's own virtual device.
 pub const VIRTUAL: &str = "virtual";
+/// A pool stream's audio: silence, or a network device's while the
+/// daemon connects it to one.
+pub const POOL_STREAM: &str = "pool";
 
 /// An output's tones, one on each channel, and an input's analysis.
 pub const TONES: &str = "tones";
@@ -593,7 +620,7 @@ pub fn computer_name() -> String {
 #[cfg(feature = "daemon")]
 fn source_of(audio: Option<&str>, first_channel: u16) -> Source {
     match audio {
-        None | Some("silence" | VIRTUAL | TONES) => Source::Silence,
+        None | Some("silence" | VIRTUAL | TONES | POOL_STREAM) => Source::Silence,
         Some("tone") => Source::Tone {
             hertz: 1000.0,
             level: 0.1,
@@ -613,7 +640,7 @@ fn source_of(audio: Option<&str>, first_channel: u16) -> Source {
 #[cfg(feature = "daemon")]
 fn sink_of(audio: Option<&str>, first_channel: u16) -> Sink {
     match audio {
-        None | Some("discard" | VIRTUAL | ANALYZE) => Sink::Discard,
+        None | Some("discard" | VIRTUAL | ANALYZE | POOL_STREAM) => Sink::Discard,
         Some("default") => Sink::Device {
             name: None,
             first_channel,
@@ -724,12 +751,12 @@ impl Config {
 
     /// The talkers the default entity keeps for destinations.
     pub fn talker_pool(&self) -> u8 {
-        self.destination_talkers.unwrap_or(POOL)
+        self.destination_talkers.unwrap_or(POOL_SIZE)
     }
 
     /// The listeners the default entity keeps for sources.
     pub fn listener_pool(&self) -> u8 {
-        self.source_listeners.unwrap_or(POOL)
+        self.source_listeners.unwrap_or(POOL_SIZE)
     }
 
     /// Whether any stream on another device may get a device here, so
@@ -827,14 +854,17 @@ impl Config {
         changed
     }
 
-    /// The settings of the port itself, as against the entities and the
-    /// network devices: a change to them starts the daemon again.
-    pub fn port_settings(&self) -> (LiteChoice, bool, Option<u8>, Option<u16>) {
+    /// The settings of the port itself and of the default entity's pools,
+    /// as against the entities and the network devices: a change to them
+    /// starts the daemon again.
+    pub fn port_settings(&self) -> (LiteChoice, bool, Option<u8>, Option<u16>, u8, u8) {
         (
             self.avb_lite,
             self.multicast_escalation,
             self.unicast_fanout,
             self.media_vlan,
+            self.talker_pool(),
+            self.listener_pool(),
         )
     }
 
@@ -1543,7 +1573,10 @@ mod tests {
         let output = RemoteStream::source(SPEAKER, 0);
         assert!(config.shows(&input));
         assert!(!config.shows(&output));
-        assert_eq!((config.talker_pool(), config.listener_pool()), (POOL, POOL));
+        assert_eq!(
+            (config.talker_pool(), config.listener_pool()),
+            (POOL_SIZE, POOL_SIZE)
+        );
         let written = toml::to_string(&config).unwrap();
         assert!(!written.contains("destinations"), "{written}");
         assert!(!written.contains("sources"), "{written}");

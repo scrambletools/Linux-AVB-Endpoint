@@ -46,8 +46,8 @@ talker gets a recording device once pinned, or with
 `mode sources all`. `list` names each by name or by
 `<entity id>:in<n>` and `<entity id>:out<n>`, and the others take
 either.
-On this branch the devices appear but do not yet connect to the
-network: connecting and releasing are still to build
+On this branch a destination connects as an app plays into it and
+lets go 30 s after; a source does not connect yet
 ([docs/endpointd.md](docs/endpointd.md)).
 
 ## The files
