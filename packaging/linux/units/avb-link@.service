@@ -18,7 +18,10 @@ Before=gptpd@%i.service
 # over them by a hash of their first octets, a stream's own sequence
 # number among them, and they leave out of order as the queues drain.
 # It is set after the queue disciplines: replacing a root that divides
-# the queues into classes, as mqprio does, resets it.
+# the queues into classes, as mqprio does, resets it. Such a root also
+# leaves its map from priorities to classes on the interface, and a
+# frame whose priority maps past the one class left skips the pin, so
+# the root is first made one class of every queue, every priority in it.
 #
 # That queue may hold at least as many bytes as the link sends in about
 # 130 us, 16 KiB at a gigabit: under memory load a card's completions run
@@ -56,6 +59,11 @@ ExecStart=/bin/sh -c '\
     queues=0; for queue in /sys/class/net/"$$1"/queues/tx-*; do \
         [ -e "$$queue" ] && queues=$$((queues + 1)); done; \
     if [ $$queues -gt 1 ]; then \
+        tc qdisc show dev "$$1" 2>/dev/null \
+            | grep -Eq "^qdisc (mqprio|taprio) [0-9a-f]+: root" \
+            && tc qdisc replace dev "$$1" root handle 2: mqprio num_tc 1 \
+                map 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 queues "$$queues"@0 hw 0 \
+                2>/dev/null; \
         tc qdisc show dev "$$1" 2>/dev/null | grep -q "^qdisc mq 1: root" \
             || tc qdisc replace dev "$$1" root handle 1: mq 2>/dev/null; \
         tc qdisc show dev "$$1" 2>/dev/null \
