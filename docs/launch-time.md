@@ -166,16 +166,24 @@ load on the CPU delays.
   Neighbors see the rate move slowly, as beside any ptp4l with phc2sys.
 - PTP_SYS_OFFSET_EXTENDED reads the clock against CLOCK_TAI to tens of
   ns (PRECISE on i225 and i226 where the platform has PTM), so a slow
-  loop holds it well within a microsecond. CLOCK_TAI itself steps: with
-  the wall clock (an NTP step at boot, a manual set) and by 37 s if
-  chrony sets the kernel's TAI offset later. The record says whether the
-  clock follows CLOCK_TAI, and within what; on a step gptpd drops that,
-  talkers send when due meanwhile, and the card's clock steps only with
-  a new generation. While gptpd is grandmaster its time is the card's
-  clock, so steering it steers the domain: then it follows CLOCK_TAI
-  only very slowly, or not at all.
-- The record's new field is a format change (gptp::time's VERSION and
-  RECORD_LEN), so readers and gptp's release move with it.
+  loop holds it well within a microsecond. gptpd steps the card's clock
+  to CLOCK_TAI once as it starts, a new generation for talkers.
+  CLOCK_TAI itself steps: with the wall clock (an NTP step at boot, a
+  manual set) and by 37 s if chrony, or ntpd with a leap second file,
+  sets the kernel's TAI offset later; the card's clock then steps with
+  it. Where nothing sets that offset, as with systemd-timesyncd, it is 0
+  and CLOCK_TAI reads UTC. Launch time works the same, ETF and the card
+  comparing on that one clock, but nothing may assume the 37 s. The
+  record says whether the clock follows CLOCK_TAI, and within what; on a
+  step gptpd drops that, talkers send when due meanwhile, and the card's
+  clock steps only with a new generation. While gptpd is grandmaster its
+  time is the card's clock, so steering it steers the domain: then it
+  follows CLOCK_TAI only very slowly, or not at all.
+- The record's new field, `tai`, the card's clock against CLOCK_TAI as
+  an i16 of ns, fills octets 18 and 19, which were padding, flagged by
+  bit 2 of octet 17. VERSION and RECORD_LEN stay, so older readers keep
+  working; a talker needs gptp's release to read it. Where it is
+  present, the record's line is on the clock the card launches by.
 - On igc, turning on any TSN offload (ETF, CBS) switches the card to its
   TSN mode and resets the port, link and clock, so the queue is set up
   before the link comes up. Whether igb resets an I210 the same way is
