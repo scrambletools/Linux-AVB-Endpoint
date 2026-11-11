@@ -17,6 +17,8 @@ Before=gptpd@%i.service
 # card with several, as the Intel I210 has four, otherwise spreads frames
 # over them by a hash of their first octets, a stream's own sequence
 # number among them, and they leave out of order as the queues drain.
+# It is set after the queue disciplines: replacing a root that divides
+# the queues into classes, as mqprio does, resets it.
 #
 # That queue may hold at least as many bytes as the link sends in about
 # 130 us, 16 KiB at a gigabit: under memory load a card's completions run
@@ -41,10 +43,6 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c '\
     state() { ethtool --show-eee "$$1"; ethtool --show-pause "$$1"; } 2>/dev/null; \
-    for queue in /sys/class/net/"$$1"/queues/tx-*; do \
-        echo 0 >"$$queue/xps_cpus"; done 2>/dev/null; \
-    cat /proc/irq/default_smp_affinity 2>/dev/null \
-        >"/sys/class/net/$$1/queues/tx-0/xps_cpus"; \
     speed=0; tries=0; \
     while [ $$(( $$(cat "/sys/class/net/$$1/flags" 2>/dev/null || echo 0) & 1 )) -eq 1 ] \
         && [ $$tries -lt 100 ]; do \
@@ -68,6 +66,10 @@ ExecStart=/bin/sh -c '\
             | grep -Eq "^qdisc fq_codel [0-9a-f]+: root " \
             || tc qdisc replace dev "$$1" root fq_codel 2>/dev/null; \
     fi; \
+    for queue in /sys/class/net/"$$1"/queues/tx-*; do \
+        echo 0 >"$$queue/xps_cpus"; done 2>/dev/null; \
+    cat /proc/irq/default_smp_affinity 2>/dev/null \
+        >"/sys/class/net/$$1/queues/tx-0/xps_cpus"; \
     before=$$(state "$$1"); \
     ethtool --set-eee "$$1" eee off 2>/dev/null; \
     ethtool --pause "$$1" autoneg off rx off tx off 2>/dev/null \
