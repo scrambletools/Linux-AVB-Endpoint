@@ -1,7 +1,9 @@
 # Launch time
 
 Status: design. It comes through avb-endpointd (endpointd.md). The
-separate stream service, avb-streamd (streamd.md), is shelved.
+separate stream service, avb-streamd (streamd.md), is shelved. In the
+card: gptpd's side, follow-TAI, is built (gptp 0.2.0, unreleased) and
+on its first bench test.
 
 ## Why
 
@@ -152,59 +154,109 @@ load on the CPU delays.
   gptpd's record already gives (the grandmaster's time as a line against
   the port's hardware clock), and the card's clock must stay near
   CLOCK_TAI, well within `delta`, for ETF to hand frames over in time.
-  gptpd lets the clock run free and takes off any adjustment as it
-  starts, so keeping it near CLOCK_TAI is gptpd's to do: slewing its
-  frequency, never stepping it but at a start or after a reset.
+- gptpd keeps it there where the interface's settings ask, with
+  `follow-tai yes` in /etc/gptpd/IF.conf. It is off by default, and
+  only an end station with one port takes it, never a bridge. Without
+  it gptpd lets the clock run free and takes off any adjustment as it
+  starts, as before.
+- With it, gptpd reads the card's clock against CLOCK_TAI at each
+  comparison, every 100 ms (PTP_SYS_OFFSET_EXTENDED, to tens of ns;
+  PRECISE on i225 and i226 where the platform has PTM), and slews its
+  frequency right after: an offset closes over about 20 s, and the rate
+  changes at most 0.1 ppm a comparison while the clock follows
+  CLOCK_TAI, 1 ppm while it closes on it. The clock follows CLOCK_TAI
+  after 10 comparisons in a row within 10 us.
+- gptpd sets the clock only when it stands more than 1 ms off: as gptpd
+  starts, after the driver reset the card, or when CLOCK_TAI itself
+  stepped. Each set is a new generation for talkers.
 - gptpd keeps its whole model, Pdelay, its lines, its jump check and
-  generations, on a virtual free clock: the hardware clock less the
-  integral of the frequency it has commanded, which it knows to well
-  under a microsecond. A plain servo would trip its jump check (1 us
-  over a 100 ms comparison) and bend its lines. Only the record goes
-  back to the real, steered clock, which the card launches by. Each
-  change is small (about 0.1 ppm), made right after a comparison, so a
-  talker carrying a record up to 100 ms old is off by under 10 ns.
-  Neighbors see the rate move slowly, as beside any ptp4l with phc2sys.
-- PTP_SYS_OFFSET_EXTENDED reads the clock against CLOCK_TAI to tens of
-  ns (PRECISE on i225 and i226 where the platform has PTM), so a slow
-  loop holds it well within a microsecond. gptpd steps the card's clock
-  to CLOCK_TAI once as it starts, a new generation for talkers.
-  CLOCK_TAI itself steps: with the wall clock (an NTP step at boot, a
+  generations, on a virtual free clock: the hardware clock less what
+  the steering added, each change of frequency and when it was made
+  remembered, so time stamps some seconds old still convert. A plain
+  servo would trip its jump check (1 us over a 100 ms comparison) and
+  bend its lines. Only the record goes back to the real, steered clock,
+  which the card launches by, so a talker carrying a record one
+  comparison old is off by under 10 ns. Neighbors see the rate move
+  slowly, as beside any ptp4l with phc2sys.
+- CLOCK_TAI itself steps: with the wall clock (an NTP step at boot, a
   manual set) and by 37 s if chrony, or ntpd with a leap second file,
   sets the kernel's TAI offset later; the card's clock then steps with
   it. Where nothing sets that offset, as with systemd-timesyncd, it is 0
   and CLOCK_TAI reads UTC. Launch time works the same, ETF and the card
-  comparing on that one clock, but nothing may assume the 37 s. The
-  record says whether the clock follows CLOCK_TAI, and within what; on a
-  step gptpd drops that, talkers send when due meanwhile, and the card's
-  clock steps only with a new generation. While gptpd is grandmaster its
-  time is the card's clock, so steering it steers the domain: then it
-  follows CLOCK_TAI only very slowly, or not at all.
-- The record's new field, `tai`, the card's clock against CLOCK_TAI as
-  an i16 of ns, fills octets 18 and 19, which were padding, flagged by
-  bit 2 of octet 17. VERSION and RECORD_LEN stay, so older readers keep
-  working; a talker needs gptp's release to read it. Where it is
+  comparing on that one clock, but nothing may assume the 37 s.
+- While gptpd is grandmaster its time is the card's clock, so steering
+  it would steer the domain: gptpd leaves the clock alone then.
+- The record's field `tai`, the card's clock against CLOCK_TAI as an i16
+  of ns, fills octets 18 and 19, which were padding, flagged by bit 2 of
+  octet 17. VERSION and RECORD_LEN stay, so older readers keep working;
+  gptp 0.2.0's `time::Mapping::tai` reads it. It is None while the clock
+  does not follow CLOCK_TAI (closing on it, after a set, gptpd
+  grandmaster), and talkers send when due meanwhile. Where it is
   present, the record's line is on the clock the card launches by.
 - On igc, turning on any TSN offload (ETF, CBS) switches the card to its
   TSN mode and resets the port, link and clock, so the queue is set up
-  before the link comes up. Whether igb resets an I210 the same way is
-  to be checked.
-- ETF drops frames without a time, so it gets a queue of the streams'
-  own: mqprio maps the streams' priorities to queue 0, with ETF offload
-  on it, and the rest of the traffic to the other queues.
+  before the link comes up. igb does the same to an I210: on the bench
+  on 2026-11-11, turning ETF offload on reset the card and set its clock
+  from CLOCK_REALTIME (4.3176 s on, then 171 us), and gptpd took the
+  port down about 3 s and began a new generation. With follow-TAI,
+  gptpd then sets the clock back to CLOCK_TAI.
+- ETF drops frames without a time, so only launch-stamped stream
+  sockets go to its queue. They take priority 5, which mqprio maps to
+  queue 0, with ETF offload on it. Untimed streams (3), fq pacing (6)
+  and control (0: ATDECC, MRP, gptpd) go to queues 1 to 3, which keep
+  fq_codel with the byte queue floor, so ETF never gets a frame without
+  a time on a mixed bench:
+
+  ```
+  mqprio num_tc 2 map 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 1 queues 1@0 3@1 hw 0
+  etf clockid CLOCK_TAI delta 500000 offload    (queue 0)
+  ```
+
+  `delta`, 500 us, is still to be measured.
 - A CLOCK_TAI time on SO_TXTIME needs CAP_NET_ADMIN: the helper that
   opens the streams' sockets (plaa-netraw, triib-netraw, or avb-netraw
-  with avb-endpointd) sets it before passing the socket on.
-- The talker hands each frame over about 1 ms ahead, stamped with its
-  slot's time on the card's clock; ETF drops one already late, which the
-  talker counts as left out.
-- With no gptpd keeping the clock near CLOCK_TAI, or a card without
-  LaunchTime, frames go out as today, when due.
+  with avb-endpointd) sets SO_TXTIME {CLOCK_TAI,
+  SOF_TXTIME_REPORT_ERRORS}, without deadline mode, before passing the
+  socket on; raw-ether's `Kind::Launch` sets it. Whether avb-netraw is
+  given cap_net_admin is still to be decided.
+- The talker hands each frame over 1 ms ahead (`CARD_AHEAD`). Its stamp
+  is the latest of three: its slot's time on the card's clock, the
+  card's clock now plus 200 us (`CARD_LATE`), and the previous frame's
+  stamp, as ETF also drops a frame timed before the last one. A frame
+  that would then leave past its allowance is skipped, and counted as
+  skipped. Drops ETF still makes come back on the socket's error queue
+  (SO_EE_ORIGIN_TXTIME), counted as missed launches (`launches_missed`),
+  not as send errors.
+- While the record has no `tai` (gptpd before 0.2.0, follow-TAI off, or
+  the clock not yet following CLOCK_TAI), the socket goes back to
+  priority 3 and sends unstamped, when due, so its frames take queues 1
+  to 3 rather than ETF's. A card without LaunchTime sends as today.
+- avb-endpointd's packages then need gptpd 0.2.0 or later where launch
+  time is used.
 
-## Later: in the card (as first noted)
+## Bench, 2026-11-11
 
-The Intel I210 and newer cards can send a frame at a time to the
-nanosecond themselves (LaunchTime), through the ETF queue discipline
-with offload. That needs the card's PTP clock to follow CLOCK_TAI, which
-gptpd does not steer, and a queue of the stream's own, as ETF drops
-frames without a time. It would take the release off the CPU entirely,
-and needs gptpd's side settled first.
+Follow-TAI's first hour, on a desktop's I210 (igb) with a MOTU switch
+as grandmaster, 19:24:12 to 20:24:12 UTC, then a quarter hour on the
+same build with follow-TAI off, 20:25:00 to 20:40:00, to compare.
+
+- As it started gptpd set the card's clock 710 ms on to CLOCK_TAI, and
+  12 s later it followed it, 9.5 us off. For the rest of the hour it
+  stood 7 to 66 ns from CLOCK_TAI at each report.
+- It stopped following only while gptpd was grandmaster, four times
+  for about 2.5 s, when the switch's Sync to this port stopped, and
+  the record dropped `tai` then, as it should.
+- The talker sent 8000 frames every second through the set and the
+  hour, none skipped, its worst wake 392 us. At the listener's tap its
+  presentation times held within about 1 us of the grandmaster's time
+  across the set, with no step.
+- With follow-TAI off nothing changed at the talker or the listener:
+  worst wake 283 us, presentation times within 5.5 us, the listener's
+  counters flat in both runs.
+- About one Sync in 60 came without a receive time stamp in both runs
+  (8.3 and 9.2 a minute), so the steering does not cause them.
+- The four Sync timeouts came from the switch, not the steering. Its
+  schedule slips about 2.2 ms some 1.6 times a minute on every port,
+  and after about one slip in twenty it stops Sync to this port for
+  2.5 s; another port saw no stop. The rate was the same before
+  follow-TAI.
