@@ -227,10 +227,10 @@ pub struct StreamConfig {
     #[serde(default = "eight")]
     pub channels: u16,
     /// Where its audio comes from or goes: "virtual", its own virtual
-    /// audio device, when left out; "silence" or "tone" for an output, or
-    /// "tones", a tone of its own on each channel; "discard" for an input,
-    /// or "analyze", checked against the tones it carries; "default"; or
-    /// a device's name.
+    /// audio device, when left out; "ring", an app's through its ring;
+    /// "silence" or "tone" for an output, or "tones", a tone of its own on
+    /// each channel; "discard" for an input, or "analyze", checked against
+    /// the tones it carries; "default"; or a device's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
     /// The device channel its first channel comes from or goes to, where
@@ -258,6 +258,10 @@ pub struct StreamConfig {
     /// a controller picks decides it after.
     #[serde(default, skip_serializing_if = "SrClass::is_a")]
     pub class: SrClass,
+    /// For a stream whose audio is "ring", the frames its ring holds, a
+    /// power of two from 4096 to 262144; 16384 when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_frames: Option<u32>,
 }
 
 fn is_zero(value: &u16) -> bool {
@@ -280,6 +284,7 @@ impl StreamConfig {
             bound: None,
             mappings: None,
             class: SrClass::A,
+            ring_frames: None,
         }
     }
 
@@ -363,6 +368,12 @@ impl StreamConfig {
         !self.clock && self.audio.as_deref().is_none_or(|audio| audio == VIRTUAL)
     }
 
+    /// Whether an app takes or gives its audio through its ring; never a
+    /// media clock's.
+    pub fn is_ring(&self) -> bool {
+        !self.clock && self.audio.as_deref() == Some(RING)
+    }
+
     /// Whether an output sends a tone of its own on each channel.
     pub fn has_tones(&self) -> bool {
         !self.clock && self.audio.as_deref() == Some(TONES)
@@ -388,6 +399,8 @@ impl StreamConfig {
 
 /// The audio of a stream's own virtual device.
 pub const VIRTUAL: &str = "virtual";
+/// The audio of a stream an app takes or gives through its ring.
+pub const RING: &str = "ring";
 /// A pool stream's audio: silence, or a network device's while the
 /// daemon connects it to one.
 pub const POOL_STREAM: &str = "pool";
@@ -620,7 +633,7 @@ pub fn computer_name() -> String {
 #[cfg(feature = "daemon")]
 fn source_of(audio: Option<&str>, first_channel: u16) -> Source {
     match audio {
-        None | Some("silence" | VIRTUAL | TONES | POOL_STREAM) => Source::Silence,
+        None | Some("silence" | VIRTUAL | TONES | POOL_STREAM | RING) => Source::Silence,
         Some("tone") => Source::Tone {
             hertz: 1000.0,
             level: 0.1,
@@ -640,7 +653,7 @@ fn source_of(audio: Option<&str>, first_channel: u16) -> Source {
 #[cfg(feature = "daemon")]
 fn sink_of(audio: Option<&str>, first_channel: u16) -> Sink {
     match audio {
-        None | Some("discard" | VIRTUAL | ANALYZE | POOL_STREAM) => Sink::Discard,
+        None | Some("discard" | VIRTUAL | ANALYZE | POOL_STREAM | RING) => Sink::Discard,
         Some("default") => Sink::Device {
             name: None,
             first_channel,

@@ -2,12 +2,12 @@
 //! gptpd's state, driving each entity and the MSRP and MVRP participants,
 //! and starting and stopping the streams as reservations come and go.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, PoisonError, Weak};
 use std::time::SystemTime;
 use std::time::{Duration, Instant as Clock};
 
@@ -28,7 +28,7 @@ use avb_mrp::msrp::{self, ListenerState, TalkerDeclaration, TalkerFailure};
 use avb_mrp::sharing::{self as sharing_protocol, Hello, Mode, Notice, Refusal, Request};
 use avb_net::Socket;
 use avb_net::stream::FrameSender;
-use avb_stream::audio::{SharedBuffer, Sink, Source};
+use avb_stream::audio::{Blocks, SharedBuffer, Sink, Source};
 use avb_stream::formats;
 use avb_stream::{
     GroupConfig, GroupListener, GroupStream, GroupTalker, ListenerConfig, ListenerGroup,
@@ -50,6 +50,8 @@ use crate::meters::{self, Meters, StreamMeter};
 use crate::model::Identity;
 use crate::port::{Port, VLAN};
 use crate::profile;
+use crate::ring::StreamRef;
+use crate::ring::serve::{Ring, Rings, Server as RingServer};
 use crate::sharing::{self, Server, Sharers};
 use crate::signal;
 use crate::status::{
@@ -289,6 +291,9 @@ struct OutputState {
     pool_source: Option<SharedBuffer>,
     /// Its test tones, where it sends them.
     tones: Option<signal::Tones>,
+    /// The ring an app gives its audio through, where its audio is an
+    /// app's.
+    ring: Option<Arc<Ring>>,
     /// Its place in the MAAP block, kept while it runs, so endpoints
     /// coming and going leave its stream's address as it is.
     slot: u16,
@@ -372,6 +377,9 @@ struct InputState {
     /// For a pool listener, the network device it fills while the daemon
     /// binds it to that device's talker, as wide as the device.
     pool_sink: Option<SharedBuffer>,
+    /// The ring an app takes its audio through, where its audio is an
+    /// app's.
+    ring: Option<Arc<Ring>>,
     /// Its listening while its audio is analyzed.
     run: Option<signal::Run>,
     /// The stream it was last counted among the listeners of.
@@ -823,6 +831,37 @@ impl Endpoint {
         self.make_missing_devices(audio);
     }
 
+    /// The rings of its streams whose audio is an app's, for those that
+    /// have none: kept while the stream is, so an app stays attached as
+    /// its talker or listener starts and stops.
+    fn make_missing_rings(&mut self) {
+        let made = |out: bool, stream: &StreamConfig| {
+            let frames = stream.ring_frames.unwrap_or(crate::ring::DEFAULT_FRAMES);
+            match Ring::new(out, stream.channels, frames) {
+                Ok(ring) => Some(ring),
+                Err(error) => {
+                    log(format!(
+                        "{} {}: no ring: {error}",
+                        self.config.name, stream.name
+                    ));
+                    None
+                }
+            }
+        };
+        for (index, state) in self.outputs.iter_mut().enumerate() {
+            let stream = &self.streams[self.out_streams[index]];
+            if state.ring.is_none() && stream.is_ring() {
+                state.ring = made(true, stream);
+            }
+        }
+        for (index, state) in self.inputs.iter_mut().enumerate() {
+            let stream = &self.streams[self.in_streams[index]];
+            if state.ring.is_none() && stream.is_ring() {
+                state.ring = made(false, stream);
+            }
+        }
+    }
+
     /// The virtual devices its streams that have none use, as those
     /// added while the others go on with theirs. Each runs at PipeWire's
     /// graph rate, whatever the entity's: its stream converts, so a
@@ -924,12 +963,14 @@ impl Endpoint {
                 &this.audio,
                 this.first_channel,
                 this.class,
+                this.ring_frames,
             ) == (
                 that.clock,
                 that.channels,
                 &that.audio,
                 that.first_channel,
                 that.class,
+                that.ring_frames,
             )
     }
 }
@@ -945,6 +986,10 @@ pub struct Runtime {
     /// The virtual audio devices of the streams that have them, while any
     /// do.
     audio: Option<VirtualAudio>,
+    /// The streams' rings apps may attach, and the socket they do it
+    /// through.
+    rings: Rings,
+    _ring_server: Option<RingServer>,
     /// The port's one MSRP and one MVRP participant, for every endpoint.
     port: Port,
     /// When MRP from this computer's address that this daemon did not send
@@ -1336,7 +1381,16 @@ impl Runtime {
         };
         for endpoint in &mut endpoints {
             endpoint.make_devices(audio.as_ref());
+            endpoint.make_missing_rings();
         }
+        let rings = Rings::default();
+        let ring_server = match RingServer::start(&interface, rings.clone()) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                log(format!("no socket for apps' rings: {error}"));
+                None
+            }
+        };
         for (slot, output) in endpoints
             .iter_mut()
             .flat_map(|endpoint| endpoint.outputs.iter_mut())
@@ -1346,7 +1400,7 @@ impl Runtime {
         }
         let maap = (talkers > 0).then(|| Maap::new(mac, (talkers as u16).max(MAAP_BLOCK)));
         let link_speed = found.speed.unwrap_or(0);
-        Ok(Runtime {
+        let runtime = Runtime {
             interface: interface.clone(),
             mac,
             start: Clock::now(),
@@ -1413,7 +1467,35 @@ impl Runtime {
             started: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64),
-        })
+            rings,
+            _ring_server: ring_server,
+        };
+        runtime.publish_rings();
+        Ok(runtime)
+    }
+
+    /// Lists the streams' rings for apps to attach, by their entity's
+    /// instance and their place among its outputs or inputs.
+    fn publish_rings(&self) {
+        let mut listed = BTreeMap::new();
+        for endpoint in &self.endpoints {
+            let instance = endpoint.config.instance_at(endpoint.place);
+            let stream = |index: usize| StreamRef {
+                instance,
+                index: index as u16,
+            };
+            for (index, state) in endpoint.outputs.iter().enumerate() {
+                if let Some(ring) = &state.ring {
+                    listed.insert((true, stream(index)), ring.clone());
+                }
+            }
+            for (index, state) in endpoint.inputs.iter().enumerate() {
+                if let Some(ring) = &state.ring {
+                    listed.insert((false, stream(index)), ring.clone());
+                }
+            }
+        }
+        *self.rings.lock().unwrap_or_else(PoisonError::into_inner) = listed;
     }
 
     fn elapsed(&self) -> Duration {
@@ -1643,6 +1725,7 @@ impl Runtime {
             let id = endpoint.entity.entity_id();
             endpoint.entity.set_gptp(now, gptp.clone());
             endpoint.make_missing_devices(self.audio.as_ref());
+            endpoint.make_missing_rings();
             let mut slots = kept.get(&id).cloned().unwrap_or_default().into_iter();
             for (index, output) in endpoint.outputs.iter_mut().enumerate() {
                 output.slot = slots.next().or_else(|| free.next()).unwrap_or_default();
@@ -1667,6 +1750,7 @@ impl Runtime {
             self.maap = Some(maap);
         }
         self.config = config.clone();
+        self.publish_rings();
         true
     }
 
@@ -2518,6 +2602,18 @@ impl Runtime {
     }
 
     fn write_status(&self) {
+        for endpoint in &self.endpoints {
+            for state in &endpoint.outputs {
+                if let Some(ring) = &state.ring {
+                    ring.set_running(state.talker.is_some());
+                }
+            }
+            for state in &endpoint.inputs {
+                if let Some(ring) = &state.ring {
+                    ring.set_running(state.listener.is_some());
+                }
+            }
+        }
         let Some(path) = status_path(&self.interface) else {
             return;
         };
@@ -3798,11 +3894,15 @@ impl Runtime {
         let lite = self.lite.is_some();
         let name = self.out_name(out);
         let format = stream.current_format;
+        let ring = self.output(out).ring.clone();
         let source = match (&self.output(out).device, &self.output(out).pool_source) {
             (Some(device), _) => Source::Shared(device.shared()),
             (None, Some(buffer)) => Source::Shared(buffer.clone()),
             (None, None) if endpoint.out_config(out.1).clock => Source::Silence,
-            (None, None) => endpoint.out_config(out.1).source(),
+            (None, None) => match &ring {
+                Some(ring) => Source::Blocks(Blocks(ring.clone())),
+                None => endpoint.out_config(out.1).source(),
+            },
         };
         let Some(media) = avb_stream::media::Media::of(format) else {
             log(format!(
@@ -3817,6 +3917,9 @@ impl Runtime {
         } else {
             media.sample_rate()
         };
+        if let Some(ring) = &ring {
+            ring.start(rate);
+        }
         let mut tones = None;
         let source = if endpoint.out_config(out.1).has_tones() && !media.is_clock() {
             match signal::Tones::start(stream.channels, rate) {
@@ -4073,11 +4176,17 @@ impl Runtime {
             stream_id: stream.stream_id.0,
             destinations,
             format: model.current_format,
-            sink: match (&state.device, &state.pool_sink) {
-                (Some(device), _) => Sink::Shared(device.shared()),
-                (None, Some(buffer)) => Sink::Shared(buffer.clone()),
-                (None, None) if endpoint.in_config(input.1).clock => Sink::Discard,
-                (None, None) => endpoint.in_config(input.1).sink(),
+            sink: match (&state.device, &state.pool_sink, &state.ring) {
+                (Some(device), ..) => Sink::Shared(device.shared()),
+                (None, Some(buffer), _) => Sink::Shared(buffer.clone()),
+                (None, None, _) if endpoint.in_config(input.1).clock => Sink::Discard,
+                (None, None, Some(ring)) => {
+                    if let Some(media) = avb_stream::media::Media::of(model.current_format) {
+                        ring.start(media.sample_rate());
+                    }
+                    Sink::Blocks(Blocks(ring.clone()))
+                }
+                (None, None, None) => endpoint.in_config(input.1).sink(),
             },
             recovered: Some(state.recovered.clone()),
             // Each of its audio's channels the stream channel its cluster

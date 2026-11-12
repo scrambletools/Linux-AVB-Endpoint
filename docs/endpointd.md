@@ -402,6 +402,66 @@ As triib-pipewire makes them now, moved out of triib as
     down to a 48 kHz stream. That is one more reason to keep the devices
     at the graph's rate.
 
+## App rings
+
+Apps reach the network through the daemon's PipeWire devices (the user,
+2026-11-08). For an app that needs a few milliseconds each way and each
+block's presentation time, such as a voice agent cancelling its echo
+and timing a barge-in, a stream can instead have a ring: memory the
+daemon shares with the app, which the stream's talker or listener
+thread reads or writes one frame's block at a time (the user,
+2026-11-12, with lanears its first app). The daemon stays the only MRP
+participant and the only sender.
+
+```toml
+[[endpoint.stream]]
+direction = "out"
+channels = 2
+audio = "ring"
+ring_frames = 16384   # a power of two, 4096 to 262144; 16384 if left out
+```
+
+- **Samples** are the wire's, as 32-bit words in this computer's byte
+  order, with nothing resampled, converted or buffered between: a
+  32-bit format's exactly, every bit, so a channel of flags passes as
+  it is; a 24-bit or AM824 format's in the high 24 bits; a float's
+  scaled. A ring has its stream's configured channels. A format of
+  fewer fills its first ones, the rest silent, and one of more gives
+  it its first.
+- **Each block** has a record: its first frame, its presentation time,
+  its frames and what happened to it. Inbound: late, early, frames
+  missing before it, no gPTP time, an mr change, a restart. Outbound:
+  queued audio, silence for want of it (dry) or on purpose (idle), left
+  out as too late, taken by no destination. The ring doesn't depend on
+  the SR class or the block size.
+- **Outbound,** the app queues frames ahead of the talker. After the
+  queue ran dry, a write lands a lead ahead, 2 ms unless the app sets
+  another. It can write over frames still queued, as for a fade, end
+  the queue at a frame, or drop it all at once. Frames already sent
+  still play at their presentation times, up to the stream's max
+  transit time later.
+- **The threads** take no lock and make no system call for a ring,
+  but the eventfd they write as their stream passes each multiple of
+  the frames the app asked for.
+- **Lifetime:** a ring is made when its stream is configured and kept
+  while it is. Its talker or listener starting, stopping or changing
+  format starts a new generation, and the app stays attached. With no
+  app attached, an inbound ring goes on filling and an outbound one
+  sends silence, so its stream stays bound while the app restarts.
+  When the stream goes, an attached app hears so.
+- **Attaching:** the app connects to
+  `$XDG_RUNTIME_DIR/avb-endpointd/<interface>.app`, a packet socket,
+  and asks for a stream by its entity's instance and its place among
+  the entity's inputs or outputs. It gets the ring's memory, sealed
+  against resizing, and its eventfd. A ring has one attachment at a
+  time, which lasts while the app's connection does. Of what the app
+  writes in the ring, the daemon reads only the queue's bounds and the
+  wake interval, and trusts neither for where it reads or writes.
+- **The client** is `avb_endpointd::ring`, behind the `ring` feature,
+  which needs libc alone.
+- **Later on the same socket:** vendor-defined CONTROLs and Scramble
+  OUI vendor-unique AECP for an app's entity.
+
 ## plaa on the daemon
 
 On Linux, plaa is a media app like any other: it has no entity of its

@@ -11,8 +11,10 @@
 //! streams are ([`meters`]), where those files are ([`store`]), the
 //! daemon's user unit ([`unit`]), how an entity's ID is made
 //! ([`entity_id`]), and the streams on other devices that get a device
-//! of their own here ([`devices`]). The `daemon` feature adds the
-//! daemon, for Linux.
+//! of their own here ([`devices`]). The `ring` feature adds the app
+//! rings' client ([`ring`]), for apps that take a stream's samples with
+//! their presentation times; the `daemon` feature adds the daemon, for
+//! Linux.
 
 use atdecc::EntityId;
 use avb_net::MacAddress;
@@ -36,6 +38,8 @@ pub mod lite;
 pub mod port;
 #[cfg(feature = "daemon")]
 pub mod profile;
+#[cfg(feature = "ring")]
+pub mod ring;
 #[cfg(feature = "daemon")]
 pub mod runtime;
 #[cfg(feature = "daemon")]

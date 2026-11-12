@@ -19,6 +19,7 @@ default = []
 # The daemon, which runs the entities; for Linux. Without it the crate is
 # the configuration, status and meters files that apps read and write.
 daemon = [
+    "ring",
     "dep:avb-mrp",
     "dep:avb-pipewire",
     "dep:avb-stream",
@@ -29,6 +30,10 @@ daemon = [
     "atdecc/std",
     "avb-net/std",
 ]
+
+# App rings: a stream's samples shared with an app through memory, for
+# the apps that use them; Linux only.
+ring = ["dep:libc"]
 
 [[bin]]
 name = "avb-endpointd"
