@@ -10,7 +10,12 @@
 //! - 30 s after the last app stream goes it disconnects, so pauses, seeks
 //!   and track changes cost no ACMP and MSRP round each.
 //! - It disconnects only what it connected and no one changed since: a
-//!   remote stream that went busy, or off the network, it forgets.
+//!   remote stream that went busy it forgets, and so a destination off
+//!   the network, where nothing would hear a disconnect. One no longer
+//!   shown, hidden or unpinned while connected, it disconnects at once,
+//!   or its listener would stay bound to a pool talker that may go to
+//!   another device next. A source off the network it disconnects too:
+//!   the binding is the daemon's own pool listener's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -68,6 +73,9 @@ pub struct Connections {
     /// Devices whose connect failed, not tried again until no app uses
     /// them.
     refused: BTreeSet<RemoteStream>,
+    /// Pool listeners another controller bound, which no source takes
+    /// until they are unbound.
+    held: BTreeSet<u16>,
 }
 
 impl Connections {
@@ -80,7 +88,15 @@ impl Connections {
             links: BTreeMap::new(),
             starved: Vec::new(),
             refused: BTreeSet::new(),
+            held: BTreeSet::new(),
         }
+    }
+
+    /// Which pool listeners another controller holds bound, as the caller
+    /// read them this turn: a pool listener is the daemon's own input, so
+    /// any controller may bind it, and the daemon never takes it back.
+    pub fn set_held_listeners(&mut self, pools: impl IntoIterator<Item = u16>) {
+        self.held = pools.into_iter().collect();
     }
 
     /// The connects and disconnects this turn calls for, `now` on the
@@ -88,12 +104,26 @@ impl Connections {
     pub fn update(&mut self, now: Duration, seen: &[Seen]) -> Vec<Action> {
         let mut actions = Vec::new();
         self.starved.clear();
-        // Forgotten: those off the network or no longer shown, and those
-        // another controller took, which are not ours to disconnect.
-        self.links.retain(|stream, _| {
-            seen.iter()
+        // Forgotten: those another controller took, which are not ours to
+        // disconnect, and destinations off the network. Undone: those no
+        // longer shown, and sources off the network.
+        self.links.retain(|stream, link| {
+            let remote = seen
+                .iter()
                 .find(|device| device.stream == *stream)
-                .is_some_and(|device| device.remote == DeviceState::Idle)
+                .map(|device| device.remote);
+            match remote {
+                Some(DeviceState::Idle) => true,
+                Some(DeviceState::Busy) => false,
+                Some(DeviceState::Offline) if stream.way == Way::Destination => false,
+                _ => {
+                    actions.push(Action::Disconnect {
+                        stream: *stream,
+                        pool: link.pool,
+                    });
+                    false
+                }
+            }
         });
         // A device no app uses may be tried again once one does.
         self.refused.retain(|stream| {
@@ -180,16 +210,25 @@ impl Connections {
         self.links.get(stream).map(|link| link.pool)
     }
 
+    /// Each device connected or being connected, with its pool stream.
+    pub fn links(&self) -> Vec<(RemoteStream, u16)> {
+        self.links
+            .iter()
+            .map(|(stream, link)| (*stream, link.pool))
+            .collect()
+    }
+
     fn free_pool(&self, way: Way) -> Option<u16> {
         let size = match way {
             Way::Destination => self.talkers,
             Way::Source => self.listeners,
         };
         (0..size).find(|pool| {
-            !self
-                .links
-                .iter()
-                .any(|(stream, link)| stream.way == way && link.pool == *pool)
+            !(way == Way::Source && self.held.contains(pool))
+                && !self
+                    .links
+                    .iter()
+                    .any(|(stream, link)| stream.way == way && link.pool == *pool)
         })
     }
 }
@@ -340,7 +379,101 @@ mod tests {
         assert_eq!(actions.len(), 1);
         connections.connected(&main, true);
         // Gone from the network: forgotten.
-        assert!(connections.update(secs(10), &[]).is_empty());
+        assert!(
+            connections
+                .update(secs(10), &[seen(main, true, DeviceState::Offline)])
+                .is_empty()
+        );
         assert_eq!(connections.pool(&main), None);
+    }
+
+    /// A device no longer shown is disconnected at once, app or not, and
+    /// so a source off the network, its pool listener being the daemon's.
+    #[test]
+    fn what_stops_showing_is_disconnected() {
+        let mut connections = Connections::new(4, 4);
+        let main = speaker(0);
+        let mic = RemoteStream::source(EntityId(0x001b_92ff_fe01_4567), 0);
+        assert_eq!(
+            connections.update(
+                secs(0),
+                &[
+                    seen(main, true, DeviceState::Idle),
+                    seen(mic, true, DeviceState::Idle)
+                ]
+            ),
+            [
+                Action::Connect {
+                    stream: main,
+                    pool: 0
+                },
+                Action::Connect {
+                    stream: mic,
+                    pool: 0
+                }
+            ],
+            "each way has a pool of its own"
+        );
+        connections.connected(&main, true);
+        connections.connected(&mic, true);
+        // Hidden while playing: its listener lets go of the pool talker.
+        assert_eq!(
+            connections.update(secs(1), &[seen(mic, true, DeviceState::Idle)]),
+            [Action::Disconnect {
+                stream: main,
+                pool: 0
+            }]
+        );
+        assert_eq!(connections.pool(&main), None);
+        // The talker leaves the network: the pool listener is unbound.
+        assert_eq!(
+            connections.update(secs(2), &[seen(mic, true, DeviceState::Offline)]),
+            [Action::Disconnect {
+                stream: mic,
+                pool: 0
+            }]
+        );
+        assert_eq!(connections.pool(&mic), None);
+    }
+
+    /// A pool listener another controller holds is passed over; once it is
+    /// let go, it is free again.
+    #[test]
+    fn a_held_pool_listener_is_passed_over() {
+        let mut connections = Connections::new(4, 2);
+        let mic = RemoteStream::source(EntityId(0x001b_92ff_fe01_4567), 0);
+        let room = RemoteStream::source(EntityId(0x001b_92ff_fe01_4567), 1);
+        connections.set_held_listeners([0]);
+        assert_eq!(
+            connections.update(secs(0), &[seen(mic, true, DeviceState::Idle)]),
+            [Action::Connect {
+                stream: mic,
+                pool: 1
+            }]
+        );
+        connections.connected(&mic, true);
+        // Both pool listeners taken: the next source says so.
+        connections.update(
+            secs(1),
+            &[
+                seen(mic, true, DeviceState::Idle),
+                seen(room, true, DeviceState::Idle),
+            ],
+        );
+        assert_eq!(connections.state(&room), Some(DeviceState::NoTalker));
+        connections.set_held_listeners([]);
+        assert_eq!(
+            connections.update(
+                secs(2),
+                &[
+                    seen(mic, true, DeviceState::Idle),
+                    seen(room, true, DeviceState::Idle),
+                ],
+            ),
+            [Action::Connect {
+                stream: room,
+                pool: 0
+            }]
+        );
     }
 }

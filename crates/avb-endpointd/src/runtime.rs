@@ -2,7 +2,7 @@
 //! gptpd's state, driving each entity and the MSRP and MVRP participants,
 //! and starting and stopping the streams as reservations come and go.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 use std::time::{Duration, Instant as Clock};
 
-use atdecc::acmp::AcmpFlags;
+use atdecc::acmp::{AcmpFlags, AcmpMessageType, Acmpdu};
 use atdecc::controller::CommandId;
 use atdecc::entity::{
     ClockQuality, EndpointModel, Entity, EntityEvent, InputBinding, InputReservation,
@@ -369,6 +369,9 @@ struct InputState {
     listener: Option<GroupListener>,
     /// The virtual audio device apps record it from, where it has one.
     device: Option<VirtualDevice>,
+    /// For a pool listener, the network device it fills while the daemon
+    /// binds it to that device's talker, as wide as the device.
+    pool_sink: Option<SharedBuffer>,
     /// Its listening while its audio is analyzed.
     run: Option<signal::Run>,
     /// The stream it was last counted among the listeners of.
@@ -593,7 +596,20 @@ impl Endpoint {
             // as the format decides the class.
             let channels = stream.channels.clamp(1, 60);
             let class_b = output && stream.class == SrClass::B;
-            let formats = formats::offered(channels, class_b);
+            // A pool stream's formats are up-to formats, so it takes a
+            // remote stream's current format at any count of channels up
+            // to its own, rather than the remote stream being set to one.
+            let pool = stream.is_pool();
+            let formats: Vec<StreamFormat> = if pool {
+                formats::offered(channels, class_b)
+                    .into_iter()
+                    .map(devices::up_to)
+                    .collect()
+            } else {
+                formats::offered(channels, class_b)
+            };
+            // A pool stream's current format is never an up-to one.
+            let settle = |format| if pool { devices::exact(format) } else { format };
             // The format chosen last, as offered or adapted from an up-to
             // format offered, or, where the stream's channels changed
             // since, its packing at the channels it has now.
@@ -606,9 +622,10 @@ impl Endpoint {
                             .iter()
                             .copied()
                             .find(|offered| same_packing(*offered, wanted))
+                            .map(settle)
                     })
                 })
-                .unwrap_or(formats[0]);
+                .unwrap_or_else(|| settle(formats[0]));
             StreamModel {
                 name,
                 current_format,
@@ -734,6 +751,16 @@ impl Endpoint {
     /// Its output index of pool talker `pool`, counted from 0.
     fn pool_output(&self, pool: u16) -> Option<u16> {
         self.out_streams
+            .iter()
+            .enumerate()
+            .filter(|(_, place)| self.streams[**place].is_pool())
+            .nth(usize::from(pool))
+            .map(|(at, _)| at as u16)
+    }
+
+    /// Its input index of pool listener `pool`, counted from 0.
+    fn pool_input(&self, pool: u16) -> Option<u16> {
+        self.in_streams
             .iter()
             .enumerate()
             .filter(|(_, place)| self.streams[**place].is_pool())
@@ -1019,6 +1046,9 @@ pub struct Runtime {
     /// the daemon gives its own entity.
     connections: Connections,
     connecting: HashMap<CommandId, (RemoteStream, Out)>,
+    /// Listeners on other devices the daemon asked to let go of one of
+    /// its pool talkers, until the controller reads them unbound.
+    releasing: HashSet<RemoteStream>,
     own_sequence: u16,
     /// Whether an app asked for the meters when the daemon last looked,
     /// when that was, when it last wrote them and how many times, and each
@@ -1372,6 +1402,7 @@ impl Runtime {
             network_devices: HashMap::new(),
             connections: Connections::new(u16::from(pools.0), u16::from(pools.1)),
             connecting: HashMap::new(),
+            releasing: HashSet::new(),
             own_sequence: 0,
             meters_wanted: false,
             meters_looked: Clock::now(),
@@ -1714,18 +1745,22 @@ impl Runtime {
         self.sync_network_devices();
     }
 
-    /// Connects the destinations apps play into to the pool's talkers, and
-    /// lets go of those they stopped using, as [`Connections`] decides;
-    /// then takes in how the controller's connects went.
+    /// Connects the network devices apps use to the pool's streams, the
+    /// destinations apps play into to its talkers and the sources apps
+    /// record from to its listeners, and lets go of those they stopped
+    /// using, as [`Connections`] decides; then takes in how the
+    /// controller's connects went.
     fn drive_connections(&mut self) {
         if self.discovery.is_none() {
             return;
         }
         let now = self.now();
         let since = self.elapsed();
+        self.check_pool_listeners();
+        self.release_stale(now);
         let seen: Vec<Seen> = devices::statuses(&self.config, &self.found)
             .into_iter()
-            .filter(|status| status.shown && status.way == Way::Destination)
+            .filter(|status| status.shown)
             .filter_map(|status| {
                 let stream = status.stream()?;
                 let in_use = self
@@ -1741,10 +1776,14 @@ impl Runtime {
             .collect();
         for action in self.connections.update(since, &seen) {
             match action {
-                Action::Connect { stream, pool } => self.connect_destination(now, stream, pool),
-                Action::Disconnect { stream, pool } => {
-                    self.disconnect_destination(now, stream, pool);
-                }
+                Action::Connect { stream, pool } => match stream.way {
+                    Way::Destination => self.connect_destination(now, stream, pool),
+                    Way::Source => self.connect_source(stream, pool),
+                },
+                Action::Disconnect { stream, pool } => match stream.way {
+                    Way::Destination => self.disconnect_destination(now, stream, pool),
+                    Way::Source => self.disconnect_source(stream, pool),
+                },
             }
         }
         let finished = self
@@ -1756,17 +1795,16 @@ impl Runtime {
             let Some((stream, out)) = self.connecting.remove(&command) else {
                 continue;
             };
+            // Let go of while its connect was on the way, as when hidden:
+            // there is nothing to take in, nor to remember.
+            if self.connections.pool(&stream).is_none() {
+                continue;
+            }
             self.connections.connected(&stream, done);
             let name = self.stream_name(&stream);
             if done {
                 log(format!("{name}: connected"));
-                // Used once, it stays: remembered, it keeps its device off
-                // the network.
-                if !self.config.is_pinned(&stream) {
-                    self.write_back(|config| {
-                        config.pin(stream, &name, true);
-                    });
-                }
+                self.remember(stream, &name);
             } else {
                 log(format!("{name}: could not connect"));
                 if out.0 < self.endpoints.len() {
@@ -1774,6 +1812,126 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Used once, a network device stays: remembered, it keeps its device
+    /// off the network.
+    fn remember(&self, stream: RemoteStream, name: &str) {
+        if !self.config.is_pinned(&stream) {
+            self.write_back(|config| {
+                config.pin(stream, name, true);
+            });
+        }
+    }
+
+    /// The default entity's place among the endpoints, which carries the
+    /// pools.
+    fn default_index(&self) -> Option<usize> {
+        self.endpoints
+            .iter()
+            .position(|endpoint| endpoint.config.is_default)
+    }
+
+    /// Lets go of each source whose pool listener another controller bound
+    /// elsewhere, or unbound, since the daemon bound it: it is theirs now,
+    /// and its device stays unconnected until apps stop recording from it
+    /// and start again, rather than the daemon taking it back. Then says
+    /// which pool listeners other controllers hold, which no source takes.
+    fn check_pool_listeners(&mut self) {
+        let Some(index) = self.default_index() else {
+            return;
+        };
+        let taken: Vec<(RemoteStream, u16)> = self
+            .connections
+            .links()
+            .into_iter()
+            .filter(|(stream, _)| stream.way == Way::Source)
+            .filter_map(|(stream, pool)| {
+                let input = self.endpoints[index].pool_input(pool)?;
+                (!self.binds_own(index, input, stream)).then_some((stream, input))
+            })
+            .collect();
+        for (stream, input) in taken {
+            log(format!(
+                "{}: another controller took its source listener",
+                self.stream_name(&stream)
+            ));
+            self.connections.connected(&stream, false);
+            self.input_mut(In(index, input)).pool_sink = None;
+        }
+        let ours: Vec<u16> = self
+            .connections
+            .links()
+            .into_iter()
+            .filter(|(stream, _)| stream.way == Way::Source)
+            .map(|(_, pool)| pool)
+            .collect();
+        let endpoint = &self.endpoints[index];
+        let held: Vec<u16> = (0u16..)
+            .map_while(|pool| endpoint.pool_input(pool).map(|input| (pool, input)))
+            .filter(|(pool, input)| {
+                !ours.contains(pool) && endpoint.entity.input_binding(*input).is_some()
+            })
+            .map(|(pool, _)| pool)
+            .collect();
+        self.connections.set_held_listeners(held);
+    }
+
+    /// Lets go of each listener on another device bound to one of the
+    /// default entity's pool talkers that the daemon has no connection
+    /// for, as a crash, a power cut or a stop that couldn't reach it left
+    /// it: the stream it waits for no longer comes. Once each, until the
+    /// controller reads it unbound. Only the daemon's own pool talkers
+    /// count: a binding to another of this computer's talkers, plaa's or
+    /// triib's, is theirs.
+    fn release_stale(&mut self, now: Instant) {
+        let Some(index) = self.default_index() else {
+            return;
+        };
+        let own = self.endpoints[index].entity.entity_id();
+        let endpoint = &self.endpoints[index];
+        let pools: Vec<u16> = (0u16..)
+            .map_while(|pool| endpoint.pool_output(pool))
+            .collect();
+        let bound: Vec<RemoteStream> = self
+            .found
+            .iter()
+            .filter(|found| {
+                found
+                    .bound_to
+                    .is_some_and(|(talker, output)| talker == own && pools.contains(&output))
+            })
+            .map(|found| found.stream)
+            .collect();
+        // Read unbound, or bound elsewhere: done with.
+        self.releasing.retain(|stream| bound.contains(stream));
+        let stale: Vec<RemoteStream> = bound
+            .into_iter()
+            .filter(|stream| {
+                self.connections.pool(stream).is_none() && !self.releasing.contains(stream)
+            })
+            .collect();
+        for stream in stale {
+            self.releasing.insert(stream);
+            if let Some(discovery) = &mut self.discovery {
+                discovery.disconnect(now, (stream.entity, stream.index));
+            }
+            log(format!(
+                "{}: bound to a pool talker with no connection here, released",
+                self.stream_name(&stream)
+            ));
+        }
+    }
+
+    /// Whether input `input` of entity `index` is bound to `stream`, the
+    /// talker output the daemon bound it to.
+    fn binds_own(&self, index: usize, input: u16, stream: RemoteStream) -> bool {
+        self.endpoints[index]
+            .entity
+            .input_binding(input)
+            .is_some_and(|binding| {
+                binding.talker == stream.entity && binding.talker_unique_id == stream.index
+            })
     }
 
     /// A stream on another device's name, as found.
@@ -1794,10 +1952,7 @@ impl Runtime {
             .iter()
             .find(|found| found.stream == stream)
             .and_then(|found| found.format);
-        let index = self
-            .endpoints
-            .iter()
-            .position(|endpoint| endpoint.config.is_default);
+        let index = self.default_index();
         let output = index.and_then(|index| self.endpoints[index].pool_output(pool));
         let shared = self
             .network_devices
@@ -1826,7 +1981,7 @@ impl Runtime {
             self.connections.connected(&stream, false);
             return;
         }
-        self.set_own_output_format(index, output, format);
+        self.set_own_format(index, atdecc::DescriptorType::STREAM_OUTPUT, output, format);
         let out = Out(index, output);
         self.output_mut(out).pool_source = Some(shared);
         if self.output(out).talker.is_some() {
@@ -1847,10 +2002,7 @@ impl Runtime {
     /// Lets go of destination `stream`: the controller unbinds its
     /// listener, and pool talker `pool` goes back to silence.
     fn disconnect_destination(&mut self, now: Instant, stream: RemoteStream, pool: u16) {
-        if let Some(index) = self
-            .endpoints
-            .iter()
-            .position(|endpoint| endpoint.config.is_default)
+        if let Some(index) = self.default_index()
             && let Some(output) = self.endpoints[index].pool_output(pool)
         {
             self.output_mut(Out(index, output)).pool_source = None;
@@ -1858,16 +2010,149 @@ impl Runtime {
         if let Some(discovery) = &mut self.discovery {
             discovery.disconnect(now, (stream.entity, stream.index));
         }
-        log(format!(
-            "{}: released, unused for {} s",
-            self.stream_name(&stream),
-            RELEASE.as_secs()
-        ));
+        // Asked once: no stale binding until the controller reads it.
+        self.releasing.insert(stream);
+        self.log_released(stream);
     }
 
-    /// Sets output `output` of entity `index` to `format`, as a
-    /// controller's SET_STREAM_FORMAT would, given to the entity here.
-    fn set_own_output_format(&mut self, index: usize, output: u16, format: StreamFormat) {
+    /// That a network device was let go of: off the network, no longer
+    /// shown, or unused for [`RELEASE`].
+    fn log_released(&self, stream: RemoteStream) {
+        let why = if !self.found.iter().any(|found| found.stream == stream) {
+            "off the network".into()
+        } else if !self.network_devices.contains_key(&stream) {
+            "no longer shown".into()
+        } else {
+            format!("unused for {} s", RELEASE.as_secs())
+        };
+        log(format!("{}: released, {why}", self.stream_name(&stream)));
+    }
+
+    /// Connects source `stream` to pool listener `pool`: the listener takes
+    /// the talker's current format, fills the device apps record from, and
+    /// is bound to the talker as the daemon's controller would bind it. A
+    /// talker's stream is multicast, so this takes it from no one.
+    fn connect_source(&mut self, stream: RemoteStream, pool: u16) {
+        let name = self.stream_name(&stream);
+        let format = self
+            .found
+            .iter()
+            .find(|found| found.stream == stream)
+            .and_then(|found| found.format);
+        let index = self.default_index();
+        let input = index.and_then(|index| self.endpoints[index].pool_input(pool));
+        let shared = self
+            .network_devices
+            .get(&stream)
+            .map(|(_, device)| device.shared());
+        let (Some(index), Some(input), Some(format), Some(shared)) = (index, input, format, shared)
+        else {
+            log(format!(
+                "{name}: no pool listener or format to connect it with"
+            ));
+            self.connections.connected(&stream, false);
+            return;
+        };
+        let taken = self.endpoints[index]
+            .entity
+            .model()
+            .inputs
+            .get(usize::from(input))
+            .is_some_and(|model| model.formats.iter().any(|offered| offered.admits(format)));
+        if !taken {
+            log(format!(
+                "{name}: its format {:#018x} is not one the pool takes",
+                format.0
+            ));
+            self.connections.connected(&stream, false);
+            return;
+        }
+        // Bound since this turn began, by another controller: theirs.
+        if self.endpoints[index].entity.input_binding(input).is_some() {
+            log(format!(
+                "{name}: source listener {} is another controller's",
+                pool + 1
+            ));
+            self.connections.connected(&stream, false);
+            return;
+        }
+        self.set_own_format(index, atdecc::DescriptorType::STREAM_INPUT, input, format);
+        self.input_mut(In(index, input)).pool_sink = Some(shared);
+        self.own_acmp(
+            index,
+            AcmpMessageType::BIND_RX_COMMAND,
+            (stream.entity, stream.index),
+            input,
+        );
+        // Bound at once, here: its probe of the talker goes on as any bound
+        // input's does.
+        self.connections.connected(&stream, true);
+        log(format!("{name}: connected to source listener {}", pool + 1));
+        self.remember(stream, &name);
+    }
+
+    /// Lets go of source `stream`: pool listener `pool` is unbound, where it
+    /// is still bound as the daemon bound it, and stops filling the device.
+    fn disconnect_source(&mut self, stream: RemoteStream, pool: u16) {
+        if let Some(index) = self.default_index()
+            && let Some(input) = self.endpoints[index].pool_input(pool)
+        {
+            self.input_mut(In(index, input)).pool_sink = None;
+            if self.binds_own(index, input, stream) {
+                self.own_acmp(
+                    index,
+                    AcmpMessageType::UNBIND_RX_COMMAND,
+                    (stream.entity, stream.index),
+                    input,
+                );
+            }
+        }
+        self.log_released(stream);
+    }
+
+    /// Gives input `input` of entity `index` an ACMP command from the
+    /// daemon's controller about `talker`, as a controller's over the
+    /// network would come: the socket never brings back the daemon's own
+    /// frames, and the entity answers it as it would any controller's.
+    fn own_acmp(
+        &mut self,
+        index: usize,
+        message_type: AcmpMessageType,
+        talker: (EntityId, u16),
+        input: u16,
+    ) {
+        let controller = self
+            .discovery
+            .as_ref()
+            .map_or(EntityId(0), Discovery::entity_id);
+        let listener = (self.endpoints[index].entity.entity_id(), input);
+        self.own_sequence = self.own_sequence.wrapping_add(1);
+        let command = Acmpdu::command(
+            message_type,
+            controller,
+            talker,
+            listener,
+            self.own_sequence,
+        );
+        let mut frame = [0u8; Acmpdu::FULL_LEN];
+        if let Ok(length) = command.encode(&mut frame) {
+            let now = self.now();
+            self.endpoints[index]
+                .entity
+                .handle_frame(now, self.mac, &frame[..length]);
+        }
+    }
+
+    /// Sets stream `at` of entity `index`, an output or an input as
+    /// `descriptor_type` says, to `format`, as a controller's
+    /// SET_STREAM_FORMAT would, given to the entity here.
+    fn set_own_format(
+        &mut self,
+        index: usize,
+        descriptor_type: atdecc::DescriptorType,
+        at: u16,
+        format: StreamFormat,
+    ) {
         let target = self.endpoints[index].entity.entity_id();
         let controller = self
             .discovery
@@ -1875,8 +2160,8 @@ impl Runtime {
             .map_or(EntityId(0), Discovery::entity_id);
         self.own_sequence = self.own_sequence.wrapping_add(1);
         let set = atdecc::aem::SetStreamFormat {
-            descriptor_type: atdecc::DescriptorType::STREAM_OUTPUT,
-            index: output,
+            descriptor_type,
+            index: at,
             format,
         };
         let addressing = atdecc::aem::Addressing {
@@ -3777,32 +4062,44 @@ impl Runtime {
             return;
         };
         let name = self.in_name(input);
+        let state = self.input(input);
+        // A pool listener filling a network device fills each of the
+        // device's channels with the stream's own, silence past the
+        // stream's: the device is as wide as the widest format its talker
+        // takes, the stream only as its current one.
+        let pool_channels = state.pool_sink.as_ref().map(|buffer| buffer.channels);
         let mut config = ListenerConfig {
             interface: self.interface.clone(),
             stream_id: stream.stream_id.0,
             destinations,
             format: model.current_format,
-            sink: match &self.input(input).device {
-                Some(device) => Sink::Shared(device.shared()),
-                None if endpoint.in_config(input.1).clock => Sink::Discard,
-                None => endpoint.in_config(input.1).sink(),
+            sink: match (&state.device, &state.pool_sink) {
+                (Some(device), _) => Sink::Shared(device.shared()),
+                (None, Some(buffer)) => Sink::Shared(buffer.clone()),
+                (None, None) if endpoint.in_config(input.1).clock => Sink::Discard,
+                (None, None) => endpoint.in_config(input.1).sink(),
             },
-            recovered: Some(self.input(input).recovered.clone()),
+            recovered: Some(state.recovered.clone()),
             // Each of its audio's channels the stream channel its cluster
             // is mapped from, where a controller mapped them otherwise, or
             // its own where the stream has other channels than its audio,
             // silence past the stream's.
-            channel_map: (!endpoint.entity.input_mappings_are_default(input.1))
-                .then(|| endpoint.entity.input_mappings(input.1))
-                .flatten()
-                .map(|mappings| {
-                    let mut map = vec![None; usize::from(model.channels)];
-                    for mapping in mappings {
-                        if let Some(slot) = map.get_mut(usize::from(mapping.cluster_offset)) {
-                            *slot = Some(mapping.stream_channel);
-                        }
-                    }
-                    map
+            channel_map: pool_channels
+                .map(|channels| (0..channels).map(Some).collect())
+                .or_else(|| {
+                    (!endpoint.entity.input_mappings_are_default(input.1))
+                        .then(|| endpoint.entity.input_mappings(input.1))
+                        .flatten()
+                        .map(|mappings| {
+                            let mut map = vec![None; usize::from(model.channels)];
+                            for mapping in mappings {
+                                if let Some(slot) = map.get_mut(usize::from(mapping.cluster_offset))
+                                {
+                                    *slot = Some(mapping.stream_channel);
+                                }
+                            }
+                            map
+                        })
                 })
                 .or_else(|| {
                     model
@@ -4230,6 +4527,10 @@ impl Runtime {
     fn shut_down(&mut self) {
         let since = self.elapsed();
         meters::remove(&self.interface);
+        // The listeners on other devices the daemon connected to its pool
+        // talkers let go of them, rather than staying bound to streams
+        // that end now. Its controller's disconnects go out below.
+        self.disconnect_destinations();
         if self.lite.is_some() {
             // AVB Lite's declarations go too, as no bridge withdraws them.
             for out in self.outs() {
@@ -4253,6 +4554,27 @@ impl Runtime {
             .filter_map(|out| self.endpoints[out.0].entity.output_stream(out.1))
             .map(|(stream_id, _)| stream_id)
             .collect();
+        if self.lite.is_none() {
+            // Its own declarations leave before the programs sharing the
+            // port take its participant over, so they carry only theirs:
+            // its talkers' streams, and each Listener declaration only its
+            // own inputs make. They go out first.
+            let own_listening: Vec<u64> = self
+                .port_listeners
+                .keys()
+                .copied()
+                .filter(|stream_id| self.sharers.listening(*stream_id) == 0)
+                .collect();
+            for stream_id in own_listening {
+                self.port_listeners.remove(&stream_id);
+                self.port
+                    .msrp
+                    .withdraw(since, msrp::attribute::LISTENER, &stream_id.to_be_bytes());
+            }
+            self.port
+                .withdraw_streams(since, std::mem::take(&mut streams));
+            self.send_for(Duration::from_millis(200));
+        }
         // No program connects from now on, and those that just did are
         // told with the others.
         self.sharing = None;
@@ -4294,14 +4616,39 @@ impl Runtime {
         self.sharers.close_all();
         self.port.withdraw_streams(since, streams);
         // Long enough for the withdrawals to go out.
-        let until = since + Duration::from_millis(400);
+        self.send_for(Duration::from_millis(400));
+        log("stopped");
+    }
+
+    /// Runs the participants' timers, and sends what they, the entities
+    /// and the controller queued, for `time`.
+    fn send_for(&mut self, time: Duration) {
+        let until = self.elapsed() + time;
         while self.elapsed() < until {
             let now = self.elapsed();
             self.port.handle_timeout(now);
             let _ = self.flush();
             std::thread::sleep(Duration::from_millis(20));
         }
-        log("stopped");
+    }
+
+    /// Disconnects each listener on another device the daemon connected
+    /// to one of its pool talkers, as it stops.
+    fn disconnect_destinations(&mut self) {
+        let now = self.now();
+        let linked: Vec<RemoteStream> = self
+            .connections
+            .links()
+            .into_iter()
+            .filter(|(stream, _)| stream.way == Way::Destination)
+            .map(|(stream, _)| stream)
+            .collect();
+        for stream in linked {
+            if let Some(discovery) = &mut self.discovery {
+                discovery.disconnect(now, (stream.entity, stream.index));
+            }
+            log(format!("{}: released, stopping", self.stream_name(&stream)));
+        }
     }
 }
 

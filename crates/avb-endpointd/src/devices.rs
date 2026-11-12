@@ -6,50 +6,65 @@
 //! Which of them get one is the interface's file's to say
 //! ([`crate::config::Config::shows`]): in "all" mode every compatible one
 //! found but those hidden, in "pinned" mode only those pinned. A stream is
-//! compatible where it takes one of [`CHANNEL_COUNTS`].
+//! compatible where it takes [`MOST_CHANNELS`] or fewer.
+//!
+//! The devices have one of [`CHANNEL_COUNTS`]; the pool streams carry
+//! whatever a remote stream's current format holds, up to
+//! [`MOST_CHANNELS`]. Their AAF and AM824 formats are up-to formats (IEEE
+//! 1722.1-2021, 7.3.3), so a pool stream adapts to a remote stream of 6
+//! channels, say, rather than the daemon setting the remote stream to 8.
 
 use std::fmt;
 use std::str::FromStr;
 
 use atdecc::EntityId;
+use atdecc::stream_format::{FormatKind, StreamFormat};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::Config;
 use crate::status::DeviceStatus;
 
-/// The channel counts the daemon's network devices and their streams
-/// carry, and no others.
+/// The channel counts the daemon's network devices have, and no others.
 pub const CHANNEL_COUNTS: [u16; 4] = [2, 8, 16, 32];
 
-/// The widest of [`CHANNEL_COUNTS`] among `accepted`, a remote stream's
-/// formats' channel counts: its device's width. `None` where it takes
-/// none of them.
+/// The most channels a pool stream carries, and so a remote stream may
+/// have to connect.
+pub const MOST_CHANNELS: u16 = 32;
+
+/// A network device's width: the smallest of [`CHANNEL_COUNTS`] that holds
+/// the widest of `accepted`, a remote stream's formats' channel counts, of
+/// those up to [`MOST_CHANNELS`]. `None` where it takes none of those.
 pub fn device_channels(accepted: impl IntoIterator<Item = u16>) -> Option<u16> {
-    accepted
+    let widest = accepted
         .into_iter()
-        .filter(|channels| CHANNEL_COUNTS.contains(channels))
-        .max()
+        .filter(|channels| (1..=MOST_CHANNELS).contains(channels))
+        .max()?;
+    CHANNEL_COUNTS.into_iter().find(|count| *count >= widest)
 }
 
-/// The channel count to set a remote stream to, at connect, where its
-/// current format's `current` count is none of [`CHANNEL_COUNTS`]: the
-/// smallest of them it accepts that holds the current one, else the
-/// widest it accepts, as the reservation follows the format.
-pub fn connect_channels(current: u16, accepted: impl IntoIterator<Item = u16>) -> Option<u16> {
-    let accepted: Vec<u16> = accepted
-        .into_iter()
-        .filter(|channels| CHANNEL_COUNTS.contains(channels))
-        .collect();
-    if accepted.contains(&current) {
-        return Some(current);
+/// `format` as an up-to format, where it is AAF or IEC 61883-6: as an
+/// entry in a pool stream's formats, it admits the same format with any
+/// count of channels up to its own.
+pub fn up_to(format: StreamFormat) -> StreamFormat {
+    match format.kind() {
+        FormatKind::Aaf(_) => StreamFormat(format.0 | AAF_UP_TO),
+        FormatKind::Iec61883_6(_) => StreamFormat(format.0 | IEC_UP_TO),
+        _ => format,
     }
-    accepted
-        .iter()
-        .copied()
-        .filter(|channels| *channels >= current)
-        .min()
-        .or_else(|| accepted.iter().copied().max())
 }
+
+/// `format` without its up-to flag, as a stream's current format.
+pub fn exact(format: StreamFormat) -> StreamFormat {
+    match format.kind() {
+        FormatKind::Aaf(_) => StreamFormat(format.0 & !AAF_UP_TO),
+        FormatKind::Iec61883_6(_) => StreamFormat(format.0 & !IEC_UP_TO),
+        _ => format,
+    }
+}
+
+/// The up-to flag of an AAF format, and of an IEC 61883-6 one.
+const AAF_UP_TO: u64 = 0x0080_0000_0000_0000;
+const IEC_UP_TO: u64 = 0x20 << 24;
 
 /// Which way a network device goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -185,7 +200,8 @@ pub enum DeviceState {
     NoTalker,
     /// The bridge has no bandwidth left for it.
     NoBandwidth,
-    /// It takes none of [`CHANNEL_COUNTS`].
+    /// It takes no format of [`MOST_CHANNELS`] or fewer, or its current
+    /// format holds more, which no pool stream carries.
     NoFormat,
     /// A state this reader does not know, from a newer daemon.
     #[serde(other)]
@@ -209,6 +225,8 @@ pub struct FoundStream {
     /// A listener input bound to a talker that is not the daemon's, or
     /// acquired or locked by another controller.
     pub busy: bool,
+    /// The talker output a listener input is bound to, where it is.
+    pub bound_to: Option<(EntityId, u16)>,
 }
 
 /// The streams on other devices as the status lists them: each one found,
@@ -222,8 +240,10 @@ pub fn statuses(config: &Config, found: &[FoundStream]) -> Vec<DeviceStatus> {
             let stream = found.stream;
             let channels = device_channels(found.accepted.iter().copied());
             let shown = channels.is_some() && config.shows(&stream);
+            let too_wide = found.current.is_some_and(|current| current > MOST_CHANNELS);
             let state = match channels {
                 None => DeviceState::NoFormat,
+                Some(_) if too_wide => DeviceState::NoFormat,
                 Some(_) if found.busy => DeviceState::Busy,
                 Some(_) => DeviceState::Idle,
             };
@@ -302,11 +322,13 @@ mod tests {
             current: accepted.first().copied(),
             format: None,
             busy: false,
+            bound_to: None,
         }
     }
 
     /// In "all" mode every compatible stream found has a device, but those
-    /// hidden; one that takes none of the counts has none and says so; a
+    /// hidden; a mono one has a device of 2, its one channel live; one of
+    /// more channels than a pool stream carries has none and says so; a
     /// busy one keeps its device; sources wait to be pinned.
     #[test]
     fn found_streams_show_as_the_file_says() {
@@ -314,6 +336,7 @@ mod tests {
         let living = RemoteStream::destination(SPEAKER, 0);
         let sub = RemoteStream::destination(SPEAKER, 1);
         let mono = RemoteStream::destination(AMP, 0);
+        let madi = RemoteStream::destination(AMP, 2);
         let mic = RemoteStream::source(AMP, 0);
         config.hide(sub, "Speaker Sub");
         let mut busy = found(RemoteStream::destination(AMP, 1), "Amp Zone 2", &[2, 8]);
@@ -324,6 +347,7 @@ mod tests {
                 found(living, "Speaker Main", &[2, 8]),
                 found(sub, "Speaker Sub", &[2]),
                 found(mono, "Amp Mono", &[1]),
+                found(madi, "Amp MADI", &[64]),
                 found(mic, "Amp Mic", &[2]),
                 busy,
             ],
@@ -339,14 +363,31 @@ mod tests {
         assert_eq!((main.channels, main.live_channels), (8, 2));
         assert_eq!(main.node.as_deref(), Some("avb-dest-001b92fffe0123ab-in-0"));
         assert!(by_stream(sub).hidden && !by_stream(sub).shown);
-        assert_eq!(by_stream(mono).state, DeviceState::NoFormat);
-        assert!(!by_stream(mono).shown && by_stream(mono).node.is_none());
+        let mono = by_stream(mono);
+        assert!(mono.shown && mono.state == DeviceState::Idle);
+        assert_eq!((mono.channels, mono.live_channels), (2, 1), "1 of 2");
+        assert_eq!(by_stream(madi).state, DeviceState::NoFormat);
+        assert!(!by_stream(madi).shown && by_stream(madi).node.is_none());
         assert!(!by_stream(mic).shown, "sources wait to be pinned");
         let zone = by_stream(RemoteStream::destination(AMP, 1));
         assert!(zone.shown && zone.state == DeviceState::Busy);
         // Destinations come before sources, each by name.
         assert_eq!(statuses.last().unwrap().way, Way::Source);
-        assert_eq!(statuses[0].name, "Amp Mono");
+        assert_eq!(statuses[0].name, "Amp MADI");
+    }
+
+    /// A stream that takes some count up to 32 but is set to more: it keeps
+    /// its device, which says no pool stream carries what it holds now.
+    #[test]
+    fn a_stream_set_wider_than_a_pool_stream_says_no_format() {
+        let config = Config::default();
+        let wide = RemoteStream::destination(AMP, 0);
+        let mut stream = found(wide, "Amp Wide", &[8, 32, 64]);
+        stream.current = Some(64);
+        let statuses = statuses(&config, &[stream]);
+        assert_eq!(statuses[0].channels, 32);
+        assert!(statuses[0].shown);
+        assert_eq!(statuses[0].state, DeviceState::NoFormat);
     }
 
     /// A pinned stream off the network keeps its device and says it is
@@ -374,21 +415,69 @@ mod tests {
         assert!(back[0].shown);
     }
 
+    /// A device has the smallest of the four counts that holds the widest
+    /// count its stream takes, up to 32.
     #[test]
-    fn a_device_is_as_wide_as_the_widest_count_its_stream_takes() {
+    fn a_device_holds_the_widest_count_its_stream_takes() {
         assert_eq!(device_channels([1, 2, 6, 8]), Some(8));
         assert_eq!(device_channels([2, 32, 16]), Some(32));
-        assert_eq!(device_channels([1, 6]), None);
+        assert_eq!(device_channels([1, 6]), Some(8));
+        assert_eq!(device_channels([1]), Some(2));
+        assert_eq!(device_channels([12]), Some(16));
+        assert_eq!(
+            device_channels([8, 64]),
+            Some(8),
+            "64 is past a pool stream"
+        );
+        assert_eq!(device_channels([64]), None);
+        assert_eq!(device_channels([]), None);
     }
 
+    /// A pool stream's up-to entries admit a remote stream's current
+    /// format at any count up to theirs, in AAF and in AM824, as the
+    /// bench's devices have them; the current format stays exact. The
+    /// pool's formats come from avb-stream, which only the daemon takes.
+    #[cfg(feature = "daemon")]
     #[test]
-    fn a_connect_takes_the_smallest_count_that_holds_the_current_one() {
-        // A 6-channel listener that takes 8, 16 and 32 goes to 8, not 32.
-        assert_eq!(connect_channels(6, [2, 6, 8, 16, 32]), Some(8));
-        assert_eq!(connect_channels(8, [2, 8, 32]), Some(8));
-        // None large enough: the widest it takes.
-        assert_eq!(connect_channels(12, [2, 8]), Some(8));
-        assert_eq!(connect_channels(1, [1]), None);
+    fn up_to_entries_admit_unusual_counts() {
+        use avb_stream::formats;
+        let pool: Vec<StreamFormat> = formats::offered(32, false).into_iter().map(up_to).collect();
+        let admitted = |format: StreamFormat| pool.iter().any(|entry| entry.admits(format));
+        for channels in [1, 2, 6, 8, 12, 32] {
+            assert!(admitted(formats::aaf(
+                48_000,
+                channels,
+                32,
+                formats::CLASS_A_FRAMES
+            )));
+            assert!(admitted(formats::aaf(
+                48_000,
+                channels,
+                24,
+                formats::CLASS_A_FRAMES
+            )));
+        }
+        // esp-mic's OUT 0 and IN 0: AAF at the class B cadence.
+        assert!(admitted(StreamFormat(0x0205_0220_0080_c000)));
+        assert!(admitted(StreamFormat(0x0205_0220_0200_c000)));
+        // The MOTU 8D's current AM824 format, and one of 6 channels.
+        assert!(admitted(StreamFormat(0x00a0_0208_4000_0800)));
+        assert!(admitted(formats::am824(48_000, 6)));
+        // Past a pool stream, or at a rate it doesn't take.
+        assert!(!admitted(formats::aaf(
+            48_000,
+            33,
+            32,
+            formats::CLASS_A_FRAMES
+        )));
+        assert!(
+            !admitted(StreamFormat(0x0204_0220_0080_6000)),
+            "AAF 44.1 kHz"
+        );
+        // A current format is exact, and up_to then exact gives it back.
+        let six = formats::aaf(48_000, 6, 32, formats::CLASS_A_FRAMES);
+        assert_eq!(exact(up_to(six)), six);
+        assert_ne!(up_to(six), six);
     }
 
     #[test]

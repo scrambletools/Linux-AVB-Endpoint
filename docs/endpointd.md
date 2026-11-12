@@ -555,19 +555,20 @@ Adopted (2026-11-10), as the step after step 2, for avb-endpointd
 - the default entity's pools, and for destinations, connecting a
   pool talker as an app plays into the device, at the listener's
   current format, releasing it 30 s after, and remembering the
-  device as pinned.
+  device as pinned;
+- for sources, binding a pool listener to the remote talker as an app
+  records from the device, at the talker's current format, the
+  stream's channels filling the device's first and silence the rest;
+- releasing a device at once when it is no longer shown;
+- pool streams with up-to formats, which take a remote stream's
+  current format at any count up to 32 channels (below).
 
-Still to build: sources (binding a pool listener to a remote talker),
-setting a listener whose current channel count is none of the four
-before connecting (until then it is refused), and the bench test
-with real speakers. One gap waits on avb-stream: it takes a shared
-buffer only of the stream's own channels, so a device wider than its
-stream's current format, as the channel rule makes one, cannot feed
-the pool talker until avb-stream lets a wider buffer give the
-stream's first channels. plaa has written that in avb-stream
-(2026-11-10), uncommitted until the user releases it. `scripts/smoke/connect.sh` tests connecting, with
-a PipeWire of its own, in a namespace, where no audio flows for want
-of gPTP.
+Still to build: the bench test with real speakers and microphones.
+avb-stream 0.3.5 and later let a shared buffer be wider or narrower
+than its stream, so a device wider than its stream's current format
+feeds a pool talker its first channels. `scripts/smoke/connect.sh`
+tests connecting, with a PipeWire of its own, in a namespace, where no
+audio flows for want of gPTP.
 Nothing here changes how triib's features work: triib's entities,
 devices and controller go on as they are.
 
@@ -671,22 +672,30 @@ back to read the model each time one comes, goes or is pinned.
 
 ### Channels
 
-Every stream the pools and the network devices carry has 2, 8, 16 or
-32 channels, and no other count (the user, 2026-11-10).
+Every network device has 2, 8, 16 or 32 channels, and no other count
+(the user, 2026-11-10). The pool streams carry what a remote stream's
+current format holds, up to 32 channels, so a device of an unusual
+count, such as a 6-channel amp input, connects as it is set (the user,
+2026-11-11).
 
 - **The pools' formats:** each pool stream lists AAF and AM824 formats
-  of 2, 8, 16 and 32 channels at each rate the daemon's streams take.
-  A list is only what a stream may take: MSRP reserves the current
-  format alone, at connect, so the list costs no bandwidth, and it fits
-  a stream descriptor with room to spare. Being fixed, it never changes
-  the model ID as devices come and go.
+  of 2, 8, 16 and 32 channels at each rate the daemon's streams take,
+  each an up-to format (IEEE 1722.1-2021, 7.3.3): it admits the same
+  format with any count of channels up to its own. At connect the pool
+  stream takes the remote stream's current format, adapted from one of
+  them, and the remote stream is never set to another. A list is only
+  what a stream may take: MSRP reserves the current format alone, at
+  connect, so the list costs no bandwidth, and it fits a stream
+  descriptor with room to spare. Being fixed, it never changes the
+  model ID as devices come and go.
 - **Compatible:** a remote input or output is compatible when it
-  accepts one of those counts. One that accepts none, such as an input
-  that takes only one channel, gets no device in "all" mode, and a pin
-  of it says `no-format`.
-- **A device's width:** each sink or source has the widest of those
-  counts its remote stream accepts, so a DAW routes each channel, not a
-  stereo mix. It is made once: when a controller changes the remote
+  accepts some count of 32 channels or fewer. One that accepts none,
+  such as a MADI input of 64, gets no device in "all" mode, and a pin of
+  it says `no-format`; so does one set to more than 32 while it is.
+- **A device's width:** each sink or source has the smallest of those
+  counts that holds the widest its remote stream accepts, so a DAW
+  routes each channel, not a stereo mix: 8 for a 6-channel input, 2 for
+  a mono one. It is made once: when a controller changes the remote
   stream's current format, the device stays as it is, and the stream
   carries the channels the current format holds, the rest dropped on a
   sink and silent on a source. The status says how many are live, as
@@ -725,15 +734,12 @@ Every stream the pools and the network devices carry has 2, 8, 16 or
 - **Connecting.** When the first app stream links to a destination
   sink, paused or not, the daemon takes a talker from the pool, gives it
   the listener's current format, read over AECP, and sends ACMP's
-  connect to the listener as its own controller. Where the current
-  format has none of the channel counts above, it first sets the
-  listener, unbound as it is, at its current rate, never changing the
-  rate, to the smallest of those counts it accepts that is at least the
-  current one, or the widest it accepts where none is that large: the
-  reservation follows the format, and a 6-channel listener set to 32
-  would reserve four times what it needs. A source works the same way the other
-  round, binding a pool listener to the remote talker, which takes
-  nothing from anyone, as talker streams are multicast.
+  connect to the listener as its own controller. The pool talker takes
+  the listener's current format at whatever count it holds, through
+  its up-to formats, so the reservation is what the listener takes. A
+  source works the same way the other round, binding a pool listener
+  to the remote talker at its current format, which takes nothing
+  from anyone, as talker streams are multicast.
   - **Busy:** a listener bound to another talker, or acquired or locked
     by another controller (CONTROLLER_NOT_AUTHORIZED), is busy. The
     daemon doesn't take it over and doesn't retry in a loop; the status
@@ -743,7 +749,26 @@ Every stream the pools and the network devices carry has 2, 8, 16 or
   - **Releasing:** after the last app stream unlinks, and 30 s more, the
     daemon disconnects, so pauses, seeks and track changes don't cost an
     ACMP and MSRP round each. It disconnects only a binding it made that
-    no one has changed since.
+    no one has changed since. A device hidden or unpinned while
+    connected is disconnected at once, so its listener doesn't stay
+    bound to a pool talker that may go to another device next; and a
+    source whose talker leaves the network, as its binding is the
+    daemon's own pool listener's.
+  - **Stopping:** the daemon disconnects every listener it connected,
+    then withdraws its own MSRP declarations, its talkers' and each
+    Listener declaration only its own inputs make, and lets them go out
+    before the programs sharing the port take its participant over, so
+    they carry only theirs. A listener a crash or a power cut left bound
+    to one of the default entity's pool talkers, with no connection the
+    daemon knows, it disconnects once its controller reads it; a
+    binding to another of this computer's talkers, plaa's or triib's,
+    is left alone.
+  - **Sources** bind a pool listener as the daemon's controller would,
+    given to the default entity here, as the socket never brings back
+    the daemon's own frames. A pool listener another controller binds
+    elsewhere or unbinds is theirs: its device stays unconnected until
+    apps stop recording from it and start again, and no source takes a
+    pool listener another controller holds bound.
   - **Running out:** a pool stream per connected device, given back with
     the binding. When the pool, the MAAP block (32 talkers) or the
     bridge's bandwidth runs out, the device's status says so.

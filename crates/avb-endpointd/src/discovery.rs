@@ -178,11 +178,14 @@ impl Discovery {
                         .collect();
                     accepted.sort_unstable();
                     accepted.dedup();
-                    let busy = input
-                        && model
+                    let bound_to = if input {
+                        model
                             .binding(index)
                             .and_then(|binding| binding.talker_stream())
-                            .is_some_and(|(talker, _)| !self.is_ours(talker));
+                    } else {
+                        None
+                    };
+                    let busy = bound_to.is_some_and(|(talker, _)| !self.is_ours(talker));
                     let name = if descriptor.object_name.is_empty() {
                         device.clone()
                     } else {
@@ -195,6 +198,7 @@ impl Discovery {
                         current,
                         format: Some(format),
                         busy,
+                        bound_to,
                     });
                 }
             }
