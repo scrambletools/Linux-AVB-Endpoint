@@ -17,6 +17,11 @@ Before=gptpd@%i.service
 # card with several, as the Intel I210 has four, otherwise spreads frames
 # over them by a hash of their first octets, a stream's own sequence
 # number among them, and they leave out of order as the queues drain.
+# It is set after the queue disciplines: replacing a root that divides
+# the queues into classes, as mqprio does, resets it. Such a root also
+# leaves its map from priorities to classes on the interface, and a
+# frame whose priority maps past the one class left skips the pin, so
+# the root is first made one class of every queue, every priority in it.
 #
 # That queue may hold at least as many bytes as the link sends in about
 # 130 us, 16 KiB at a gigabit: under memory load a card's completions run
@@ -41,10 +46,6 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c '\
     state() { ethtool --show-eee "$$1"; ethtool --show-pause "$$1"; } 2>/dev/null; \
-    for queue in /sys/class/net/"$$1"/queues/tx-*; do \
-        echo 0 >"$$queue/xps_cpus"; done 2>/dev/null; \
-    cat /proc/irq/default_smp_affinity 2>/dev/null \
-        >"/sys/class/net/$$1/queues/tx-0/xps_cpus"; \
     speed=0; tries=0; \
     while [ $$(( $$(cat "/sys/class/net/$$1/flags" 2>/dev/null || echo 0) & 1 )) -eq 1 ] \
         && [ $$tries -lt 100 ]; do \
@@ -58,6 +59,11 @@ ExecStart=/bin/sh -c '\
     queues=0; for queue in /sys/class/net/"$$1"/queues/tx-*; do \
         [ -e "$$queue" ] && queues=$$((queues + 1)); done; \
     if [ $$queues -gt 1 ]; then \
+        tc qdisc show dev "$$1" 2>/dev/null \
+            | grep -Eq "^qdisc (mqprio|taprio) [0-9a-f]+: root" \
+            && tc qdisc replace dev "$$1" root handle 2: mqprio num_tc 1 \
+                map 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 queues "$$queues"@0 hw 0 \
+                2>/dev/null; \
         tc qdisc show dev "$$1" 2>/dev/null | grep -q "^qdisc mq 1: root" \
             || tc qdisc replace dev "$$1" root handle 1: mq 2>/dev/null; \
         tc qdisc show dev "$$1" 2>/dev/null \
@@ -68,6 +74,10 @@ ExecStart=/bin/sh -c '\
             | grep -Eq "^qdisc fq_codel [0-9a-f]+: root " \
             || tc qdisc replace dev "$$1" root fq_codel 2>/dev/null; \
     fi; \
+    for queue in /sys/class/net/"$$1"/queues/tx-*; do \
+        echo 0 >"$$queue/xps_cpus"; done 2>/dev/null; \
+    cat /proc/irq/default_smp_affinity 2>/dev/null \
+        >"/sys/class/net/$$1/queues/tx-0/xps_cpus"; \
     before=$$(state "$$1"); \
     ethtool --set-eee "$$1" eee off 2>/dev/null; \
     ethtool --pause "$$1" autoneg off rx off tx off 2>/dev/null \
