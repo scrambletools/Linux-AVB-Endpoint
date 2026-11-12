@@ -40,6 +40,25 @@ name = "avb-endpointd"
 path = "src/main.rs"
 required-features = ["daemon"]
 
+# For the smoke tests, in a namespace: a stand-in for gptpd, and the app
+# rings checked end to end.
+[[example]]
+name = "fake_gptpd"
+required-features = ["daemon"]
+
+[[example]]
+name = "ring_check"
+required-features = ["ring"]
+
+# For an app's tests: a simulated room, and the least of an app.
+[[example]]
+name = "ring_room"
+required-features = ["ring"]
+
+[[example]]
+name = "ring_echo"
+required-features = ["ring"]
+
 [dependencies]
 atdecc = { workspace = true }
 avb-net = { workspace = true }
