@@ -18,7 +18,9 @@ env:
 jobs:
   linux:
     # Built on Ubuntu 24.04, the oldest system the packages are for, so
-    # they run on the newer ones too.
+    # they run on the newer ones too. GitHub has no RISC-V runners, so
+    # that build is cross-compiled, against Ubuntu's riscv64 libraries
+    # installed beside the runner's own, and run under QEMU.
     strategy:
       fail-fast: false
       matrix:
@@ -29,19 +31,56 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
             deb: arm64
+          - arch: riscv64
+            runner: ubuntu-24.04
+            deb: riscv64
+            target: riscv64gc-unknown-linux-gnu
+            gnu: riscv64-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.arch }}
       # cpal, for avb-stream's audio, builds against ALSA, and avb-pipewire
       # against PipeWire, through bindgen.
       - name: ALSA and PipeWire headers
+        if: ${{ !matrix.target }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2-dev libpipewire-0.3-dev libclang-dev
+      # The same for the other architecture, from Ubuntu's ports archive,
+      # with its compilers; Rust, the C its crates build, pkg-config and
+      # bindgen all pointed at them.
+      - name: ALSA and PipeWire for ${{ matrix.deb }}, and its compilers
+        if: ${{ matrix.target }}
+        run: |
+          sudo dpkg --add-architecture "$DEB"
+          . /etc/os-release
+          sudo sed -i "/^Types:/a Architectures: $(dpkg --print-architecture)" \
+            /etc/apt/sources.list.d/ubuntu.sources
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: %s\nComponents: main universe\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            "$VERSION_CODENAME $VERSION_CODENAME-updates $VERSION_CODENAME-security" "$DEB" |
+            sudo tee /etc/apt/sources.list.d/ports.sources >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "crossbuild-essential-$DEB" \
+            "libasound2-dev:$DEB" "libpipewire-0.3-dev:$DEB" libclang-dev qemu-user-static
+          variable=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          {
+            echo "CARGO_TARGET_${variable}_LINKER=$GNU-gcc"
+            echo "CC_${TARGET//-/_}=$GNU-gcc"
+            echo "CXX_${TARGET//-/_}=$GNU-g++"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "PKG_CONFIG_LIBDIR=/usr/lib/$GNU/pkgconfig:/usr/share/pkgconfig"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=--target=$GNU -I/usr/include/$GNU"
+          } >>"$GITHUB_ENV"
+        env:
+          DEB: ${{ matrix.deb }}
+          TARGET: ${{ matrix.target }}
+          GNU: ${{ matrix.gnu }}
       - name: Version
         id: version
         run: |
@@ -57,14 +96,30 @@ jobs:
           fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
       - name: Build
-        run: cargo build --release --locked -p avb-endpointd --features daemon -p avb-netraw
+        id: build
+        run: |
+          if [ -n "$TARGET" ]; then
+            cargo build --release --locked -p avb-endpointd --features daemon -p avb-netraw --target "$TARGET"
+            echo "binaries=target/$TARGET/release" >>"$GITHUB_OUTPUT"
+          else
+            cargo build --release --locked -p avb-endpointd --features daemon -p avb-netraw
+            echo "binaries=target/release" >>"$GITHUB_OUTPUT"
+          fi
+        env:
+          TARGET: ${{ matrix.target }}
       # The packages ask for the glibc nfpm.yaml names; the binaries must
       # need no newer.
       - name: Check that it runs, and the glibc it needs
         run: |
-          target/release/avb-endpointd --version
-          needed=$(for binary in target/release/avb-endpointd target/release/avb-netraw; do
-            objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//'
+          run="" objdump=objdump
+          if [ -n "$TARGET" ]; then
+            # The other architecture's loader and libraries are installed
+            # beside this one's, where QEMU finds them.
+            run=qemu-riscv64-static objdump=$GNU-objdump
+          fi
+          $run "$BINARIES/avb-endpointd" --version
+          needed=$(for binary in "$BINARIES/avb-endpointd" "$BINARIES/avb-netraw"; do
+            $objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//'
           done | sort -V | tail -1)
           declared=$(sed -n 's/.*libc6 (>= \([0-9.]*\)).*/\1/p' packaging/nfpm.yaml)
           echo "needs glibc $needed, the packages ask for $declared"
@@ -72,8 +127,12 @@ jobs:
             echo "avb-endpointd needs glibc $needed, newer than the $declared the packages ask for" >&2
             exit 1
           fi
+        env:
+          TARGET: ${{ matrix.target }}
+          GNU: ${{ matrix.gnu }}
+          BINARIES: ${{ steps.build.outputs.binaries }}
       - name: Stage
-        run: scripts/dist-install.sh target/release stage /usr
+        run: scripts/dist-install.sh ${{ steps.build.outputs.binaries }} stage /usr
       - name: Debian and RPM packages
         run: |
           curl -sSLf -o nfpm.deb \
@@ -90,7 +149,8 @@ jobs:
 
   linux-install:
     # Fresh containers of the distributions the packages are for, with
-    # gptpd's own package of the same kind put in first.
+    # gptpd's own package of the same kind put in first; RISC-V under
+    # QEMU, where Fedora has no release.
     name: linux-install (${{ matrix.image }}, ${{ matrix.arch }})
     needs: linux
     strategy:
@@ -103,6 +163,15 @@ jobs:
             runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
+          - arch: riscv64
+            image: 'debian:13'
+            runner: ubuntu-24.04
+          - arch: riscv64
+            image: 'ubuntu:24.04'
+            runner: ubuntu-24.04
+          - arch: riscv64
+            image: 'ubuntu:26.04'
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -110,11 +179,20 @@ jobs:
         with:
           name: linux-${{ matrix.arch }}
           path: packages
+      - if: matrix.arch == 'riscv64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
       - name: gptpd's package
         run: |
+          case $ARCH in
+          x86_64) deb=amd64 ;;
+          aarch64) deb=arm64 ;;
+          *) deb=$ARCH ;;
+          esac
           case $IMAGE in
           fedora:*) pattern="gptpd-*.${ARCH}.rpm" ;;
-          *) pattern="gptpd_*_$([ "$ARCH" = x86_64 ] && echo amd64 || echo arm64).deb" ;;
+          *) pattern="gptpd_*_$deb.deb" ;;
           esac
           gh release download "$GPTPD_TAG" --repo scrambletools/gptp --pattern "$pattern" --dir first
         env:
