@@ -1,6 +1,6 @@
 # Maintainer: Scramble Tools <https://github.com/scrambletools>
 pkgname=avb-endpointd
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc='Puts this computer on an AVB or Milan network, for any app'
 arch=('x86_64' 'aarch64')
