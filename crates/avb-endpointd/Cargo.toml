@@ -1,7 +1,7 @@
 [package]
 name = "avb-endpointd"
 description = "Runs a Linux computer's AVB and Milan entities with PipeWire devices any app plays into or records from: a library for the files apps share with the daemon, and the daemon behind a feature"
-version = "0.2.3"
+version = "0.3.0"
 categories = ["network-programming", "multimedia::audio"]
 keywords = ["avb", "atdecc", "milan", "pipewire"]
 edition.workspace = true

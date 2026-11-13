@@ -605,8 +605,8 @@ The link units stay as they are.
 
 ## Network devices as sinks and sources
 
-Adopted (2026-11-10), as the step after step 2, for avb-endpointd
-0.3.0. Built so far, on the network-devices branch:
+Adopted (2026-11-10), as the step after step 2, and released in
+avb-endpointd 0.3.0:
 
 - the file's modes, pins and hidden streams, and the tool;
 - the daemon's controller finding the other devices' streams, and
@@ -623,7 +623,7 @@ Adopted (2026-11-10), as the step after step 2, for avb-endpointd
 - pool streams with up-to formats, which take a remote stream's
   current format at any count up to 32 channels (below).
 
-Still to build: the bench test with real speakers and microphones.
+Still to do: the bench test with real speakers and microphones.
 avb-stream 0.3.5 and later let a shared buffer be wider or narrower
 than its stream, so a device wider than its stream's current format
 feeds a pool talker its first channels. `scripts/smoke/connect.sh`
@@ -922,6 +922,7 @@ the same audio, as AVB does natively; a settings panel.
    MRP code come out on Linux. plaa's README and PLAN catch up: the
    PLAN's AVB section is already behind the code.
 4. **Packages, releases and the bench run.**
+5. **Network devices and app rings,** in 0.3.0, on avb-stream 0.4.0.
 
 ## Decided in review
 

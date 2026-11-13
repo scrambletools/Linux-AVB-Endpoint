@@ -51,9 +51,9 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "atdecc"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "738eebba7497de90ef387ee6dc040e6b5bd38d0146aa14290bfe9b9d6bbf0992"
+checksum = "9abcb607f3eb4722a1770bf7cd489da633f7fee18aa3464451eda58687baff49"
 dependencies = [
  "avb-mrp",
  "avb-net",
@@ -70,7 +70,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "avb-endpointd"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "atdecc",
  "avb-mrp",
@@ -86,18 +86,18 @@ dependencies = [
 
 [[package]]
 name = "avb-mrp"
-version = "0.1.4"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66a54e458e40f417b6e172b611d077f4a297809e8bf6d3bc03f940b5545d07cd"
+checksum = "2b0ba64117540c5d0295af103f2630b0e5c7e7e3f45badbee76a85d0c4774a3b"
 dependencies = [
  "avb-net",
 ]
 
 [[package]]
 name = "avb-net"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7a0225dda61d7f0aae67fe4b24986a61c466682eab721c8110c35307d0ad9e"
+checksum = "394a1f77d62d102b0f0ee99e6c3dae3c240c635b785b76510c38d423b07ccaa5"
 dependencies = [
  "libc",
  "raw-ether",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "avb-pipewire"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "avb-stream",
  "pipewire",
@@ -120,9 +120,9 @@ dependencies = [
 
 [[package]]
 name = "avb-stream"
-version = "0.3.6"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cf3492ca27515fc2582a8b14376b03a14a393f3462944a2fffd0f08645f05e3"
+checksum = "cf2a664bb38e50b261d4335e2d13e3b3d770a274e66413685cdcbe22d82d3e44"
 dependencies = [
  "atdecc",
  "avb-net",
@@ -378,9 +378,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gptp"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae8e6faa2a5ca271c590ab1694dcbc1eda97e49dc5e91a9fb85707fffd59138"
+checksum = "54a135d78e91887574b20b2bab724f024709a75505ec54f0f59bf4eab5504bad"
 
 [[package]]
 name = "hashbrown"
@@ -819,9 +819,9 @@ dependencies = [
 
 [[package]]
 name = "raw-ether"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97ba549cb32f376dba4e784ec16c6e094c5d4bdf59c00da80cba43ceea5ad67c"
+checksum = "0d66ef1a3463d64480a3365492192b67212ac859bb16dde19e727eeb0b1c64be"
 dependencies = [
  "libc",
  "windows-sys",

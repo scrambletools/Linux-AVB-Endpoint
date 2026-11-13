@@ -59,6 +59,8 @@ fn main() -> std::io::Result<()> {
             local_rate: 1.0,
             asymmetry_included: false,
             residual: Some(0),
+            // No card follows CLOCK_TAI here, so talkers send when due.
+            tai: None,
         };
         let record = mapping.encode(sequence);
         for file in &files {

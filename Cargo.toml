@@ -13,13 +13,13 @@ readme = "README.md"
 # The protocol and stream crates, from scrambletools/avb on crates.io. A
 # git-ignored .cargo/avb-local.toml can point them at a checkout (see
 # README.md).
-atdecc = { version = "0.2.0", default-features = false }
-avb-mrp = { version = "0.1.4", default-features = false }
-avb-net = { version = "0.1.5", default-features = false }
-avb-stream = "0.3.6"
-avb-pipewire = { path = "crates/avb-pipewire", version = "0.1.2" }
+atdecc = { version = "0.2.2", default-features = false }
+avb-mrp = { version = "0.1.6", default-features = false }
+avb-net = { version = "0.1.6", default-features = false }
+avb-stream = "0.4.0"
+avb-pipewire = { path = "crates/avb-pipewire", version = "0.2.0" }
 # In its own repository, scrambletools/gptp.
-gptp = { version = "0.1.0", default-features = false }
+gptp = { version = "0.2.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
