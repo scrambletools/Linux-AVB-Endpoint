@@ -805,7 +805,10 @@ count, such as a 6-channel amp input, connects as it is set (the user,
     daemon doesn't take it over and doesn't retry in a loop; the status
     says so. Taking a listener over stays a deliberate act in a
     controller, as plaa's Play is now. This holds in "all" mode too,
-    so a listener another controller routes is never taken.
+    so a listener another controller routes is never taken. Another
+    talker is any but the default entity's pool talkers, this
+    computer's own included: a listener plaa's or triib's talker here
+    feeds is busy (fixed in 0.3.1; 0.3.0 counted it free).
   - **Releasing:** after the last app stream unlinks, and 30 s more, the
     daemon disconnects, so pauses, seeks and track changes don't cost an
     ACMP and MSRP round each. It disconnects only a binding it made that

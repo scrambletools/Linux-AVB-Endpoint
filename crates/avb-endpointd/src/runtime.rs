@@ -1916,6 +1916,21 @@ impl Runtime {
             .position(|endpoint| endpoint.config.is_default)
     }
 
+    /// The default entity's pool talkers as a listener's binding names
+    /// them: its entity ID and each pool output's index. A listener bound
+    /// to any other talker, this computer's included, is someone else's.
+    fn pool_talkers(&self) -> Vec<(EntityId, u16)> {
+        let Some(index) = self.default_index() else {
+            return Vec::new();
+        };
+        let endpoint = &self.endpoints[index];
+        let own = endpoint.entity.entity_id();
+        (0u16..)
+            .map_while(|pool| endpoint.pool_output(pool))
+            .map(|output| (own, output))
+            .collect()
+    }
+
     /// Lets go of each source whose pool listener another controller bound
     /// elsewhere, or unbound, since the daemon bound it: it is theirs now,
     /// and its device stays unconnected until apps stop recording from it
@@ -1969,22 +1984,11 @@ impl Runtime {
     /// count: a binding to another of this computer's talkers, plaa's or
     /// triib's, is theirs.
     fn release_stale(&mut self, now: Instant) {
-        let Some(index) = self.default_index() else {
-            return;
-        };
-        let own = self.endpoints[index].entity.entity_id();
-        let endpoint = &self.endpoints[index];
-        let pools: Vec<u16> = (0u16..)
-            .map_while(|pool| endpoint.pool_output(pool))
-            .collect();
+        let pool = self.pool_talkers();
         let bound: Vec<RemoteStream> = self
             .found
             .iter()
-            .filter(|found| {
-                found
-                    .bound_to
-                    .is_some_and(|(talker, output)| talker == own && pools.contains(&output))
-            })
+            .filter(|found| found.bound_to.is_some_and(|talker| pool.contains(&talker)))
             .map(|found| found.stream)
             .collect();
         // Read unbound, or bound elsewhere: done with.
@@ -2267,10 +2271,11 @@ impl Runtime {
     /// no longer shown; and keeps the names and channels the file lists
     /// for pinned and hidden streams current.
     fn sync_network_devices(&mut self) {
+        let pool = self.pool_talkers();
         self.found = self
             .discovery
             .as_ref()
-            .map(Discovery::found)
+            .map(|discovery| discovery.found(&pool))
             .unwrap_or_default();
         let wanted: HashMap<RemoteStream, (u16, String)> =
             devices::statuses(&self.config, &self.found)

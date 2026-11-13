@@ -133,8 +133,10 @@ impl Discovery {
     }
 
     /// The stream inputs and outputs of the entities read so far, other
-    /// than those advertised from this computer.
-    pub fn found(&self) -> Vec<FoundStream> {
+    /// than those advertised from this computer. A stream input bound to
+    /// any talker output but one of `pool`, the default entity's pool
+    /// talkers, is busy.
+    pub fn found(&self, pool: &[(EntityId, u16)]) -> Vec<FoundStream> {
         let mut found = Vec::new();
         for entity in self.controller.entities() {
             if entity.mac == self.mac {
@@ -185,7 +187,7 @@ impl Discovery {
                     } else {
                         None
                     };
-                    let busy = bound_to.is_some_and(|(talker, _)| !self.is_ours(talker));
+                    let busy = is_busy(bound_to, pool);
                     let name = if descriptor.object_name.is_empty() {
                         device.clone()
                     } else {
@@ -205,12 +207,14 @@ impl Discovery {
         }
         found
     }
+}
 
-    /// Whether `talker` is one of this computer's entities, as the
-    /// daemon's pool talkers are.
-    fn is_ours(&self, talker: EntityId) -> bool {
-        is_from(talker, self.mac)
-    }
+/// Whether a listener bound to `bound_to` is someone else's: bound to any
+/// talker output but the daemon's pool talkers, `pool`. That includes
+/// this computer's other talkers, plaa's, triib's and the default
+/// entity's own outputs, whose bindings are their controllers' to make.
+fn is_busy(bound_to: Option<(EntityId, u16)>, pool: &[(EntityId, u16)]) -> bool {
+    bound_to.is_some_and(|talker| !pool.contains(&talker))
 }
 
 /// Whether a stream of another computer's daemon is one of its default
@@ -220,12 +224,6 @@ fn is_pool(name: &str) -> bool {
         name.strip_prefix(prefix)
             .is_some_and(|number| number.parse::<u16>().is_ok())
     })
-}
-
-/// Whether `entity` has an ID [`crate::entity_id`] makes from `mac`.
-fn is_from(entity: EntityId, mac: MacAddress) -> bool {
-    let bytes = entity.0.to_be_bytes();
-    bytes[..3] == mac.0[..3] && bytes[3] == 0xff && bytes[5..] == mac.0[3..]
 }
 
 #[cfg(test)]
@@ -239,12 +237,19 @@ mod tests {
     }
 
     #[test]
-    fn this_computers_entity_ids_are_told_apart() {
+    fn a_listener_bound_to_another_of_this_computers_talkers_is_busy() {
         let mac = MacAddress([0xa0, 0x10, 0xa3, 0xa5, 0x17, 0x26]);
-        assert!(is_from(crate::entity_id(mac, 0x70), mac));
-        assert!(is_from(crate::entity_id(mac, CONTROLLER_INSTANCE), mac));
-        assert!(!is_from(EntityId(0x001b_92ff_fe01_23ab), mac));
-        let other = MacAddress([0xa0, 0x10, 0xa3, 0xa5, 0x17, 0x27]);
-        assert!(!is_from(crate::entity_id(other, 0x70), mac));
+        let default = crate::entity_id(mac, 0x70);
+        // The default entity's pool talkers, after its own output 0.
+        let pool = [(default, 1), (default, 2)];
+        assert!(!is_busy(None, &pool));
+        assert!(!is_busy(Some((default, 2)), &pool));
+        // The default entity's own stream, as plaa's bench talker is, and
+        // another entity of this computer's, as triib's would be.
+        assert!(is_busy(Some((default, 0)), &pool));
+        assert!(is_busy(Some((crate::entity_id(mac, 0x71), 1)), &pool));
+        assert!(is_busy(Some((EntityId(0x001b_92ff_fe01_23ab), 0)), &pool));
+        // With no pool, every binding is someone else's.
+        assert!(is_busy(Some((default, 1)), &[]));
     }
 }
