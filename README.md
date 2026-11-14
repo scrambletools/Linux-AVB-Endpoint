@@ -95,6 +95,17 @@ older program's entity at the default's instance, `instances.sh` on
 two interfaces at once, with a second daemon refused, and `devices.sh`
 with two daemons on a veth pair finding each other's streams.
 
+The `load_talker` example puts extra load on a link for testing a card
+or a bridge: 1 to 3 class A streams of silence beside the daemon's,
+declared nowhere, on a MAAP block or to a unicast address, with each
+stream's counts printed when it stops. `scripts/smoke/load.sh` checks
+it on a veth pair.
+
+```sh
+cargo build -p avb-endpointd --features daemon --example load_talker
+target/debug/examples/load_talker enp2s0 --streams 2
+```
+
 To build against unpublished changes to the avb or gptp crates, a
 git-ignored `.cargo/avb-local.toml` can patch them to checkouts beside
 this one, used as `cargo build --config .cargo/avb-local.toml`:

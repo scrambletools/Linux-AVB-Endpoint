@@ -59,6 +59,13 @@ required-features = ["ring"]
 name = "ring_echo"
 required-features = ["ring"]
 
+# For load tests on a link: class A streams of silence beside the
+# daemon's, declared nowhere.
+[[example]]
+name = "load_talker"
+required-features = ["daemon"]
+test = true
+
 [dependencies]
 atdecc = { workspace = true }
 avb-net = { workspace = true }
