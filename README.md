@@ -92,8 +92,10 @@ cargo build -p avb-endpointd --features daemon && scripts/smoke/held.sh
 The scripts in `scripts/smoke` run the daemon in a user and network
 namespace on dummy interfaces, and need no root: `held.sh` beside an
 older program's entity at the default's instance, `instances.sh` on
-two interfaces at once, with a second daemon refused, and `devices.sh`
-with two daemons on a veth pair finding each other's streams.
+two interfaces at once, with a second daemon refused, `devices.sh`
+with two daemons on a veth pair finding each other's streams, and
+`bind.sh` with an app binding its ring streams to the other daemon's
+each way through its own daemon.
 
 The `load_talker` example puts extra load on a link for testing a card
 or a bridge: 1 to 3 class A streams of silence beside the daemon's,

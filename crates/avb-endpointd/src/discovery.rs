@@ -23,9 +23,8 @@ pub struct Discovery {
     mac: MacAddress,
     changed: bool,
     buffer: Vec<u8>,
-    /// The commands the daemon asked for that finished, and whether
-    /// each was done.
-    finished: Vec<(CommandId, bool)>,
+    /// The commands the daemon asked for that finished, and how.
+    finished: Vec<(CommandId, Outcome)>,
 }
 
 impl Discovery {
@@ -104,10 +103,17 @@ impl Discovery {
         self.controller.disconnect(now, listener)
     }
 
-    /// The commands that finished since the last call, and whether each
-    /// was done.
-    pub fn take_finished(&mut self) -> Vec<(CommandId, bool)> {
+    /// The commands that finished since the last call, and how.
+    pub fn take_finished(&mut self) -> Vec<(CommandId, Outcome)> {
         std::mem::take(&mut self.finished)
+    }
+
+    /// Whether the controller knows `entity` to be on the network, so a
+    /// command to it goes out rather than failing at once.
+    pub fn knows(&self, entity: EntityId) -> bool {
+        self.controller
+            .entities()
+            .any(|known| known.entity_id() == entity)
     }
 
     /// Whether an entity came, went or changed since the last call.
@@ -125,7 +131,7 @@ impl Discovery {
                 | Event::EntityModelChanged(_)
                 | Event::EnumerationFailed(..) => self.changed = true,
                 Event::CommandFinished(command, outcome) => {
-                    self.finished.push((command, outcome == Outcome::Done));
+                    self.finished.push((command, outcome));
                 }
                 _ => {}
             }

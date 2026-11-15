@@ -21,6 +21,10 @@
 //! keeps an app attached: an inbound ring goes on filling while no app
 //! reads it, and an outbound one goes out as silence while nothing is
 //! queued.
+//!
+//! Through the same socket an app binds its streams to other devices'
+//! with the daemon's controller ([`App::bind`]), so it needs no
+//! controller of its own to be heard or to hear.
 
 // Shared memory, and descriptors passed over a socket, are system calls
 // libc gives only as unsafe functions.
@@ -30,8 +34,8 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 #[cfg(feature = "daemon")]
@@ -461,6 +465,264 @@ fn read_attach(message: &[u8]) -> Option<(bool, StreamRef)> {
     }
 }
 
+/// A stream on another device, as ACMP names one: its entity's ID, and
+/// the stream's index among that entity's outputs, for a talker, or its
+/// inputs, for a listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Remote {
+    pub entity: u64,
+    pub index: u16,
+}
+
+/// Why a bind, an unbind or a look at a binding did not happen.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BindError {
+    Io(io::Error),
+    /// The daemon has no such stream, or it is one of the default
+    /// entity's pool streams, which the daemon connects itself.
+    NoStream,
+    /// The stream does not offer the format asked for, or cannot change
+    /// to it now.
+    Format,
+    /// The listener refused, with its ACMP status.
+    Refused {
+        status: u8,
+    },
+    /// The listener did not answer, or the daemon's controller could not
+    /// find it on the network.
+    NoAnswer,
+    /// The listener is bound to another talker, as another controller
+    /// bound it, and is left be.
+    Elsewhere {
+        talker: Remote,
+    },
+    /// The daemon is older, and binds nothing for apps.
+    Unsupported,
+    /// The daemon's answer is not one this program knows.
+    Unknown,
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindError::Io(error) => write!(formatter, "{error}"),
+            BindError::NoStream => write!(formatter, "no such stream to bind"),
+            BindError::Format => write!(formatter, "the stream cannot take that format"),
+            BindError::Refused { status } => {
+                write!(formatter, "the listener refused, ACMP status {status}")
+            }
+            BindError::NoAnswer => write!(formatter, "the listener did not answer"),
+            BindError::Elsewhere { talker } => write!(
+                formatter,
+                "the listener is bound to 0x{:016x} output {}",
+                talker.entity, talker.index
+            ),
+            BindError::Unsupported => write!(formatter, "the daemon binds nothing for apps"),
+            BindError::Unknown => write!(formatter, "not an answer this program knows"),
+        }
+    }
+}
+
+impl std::error::Error for BindError {}
+
+impl From<io::Error> for BindError {
+    fn from(error: io::Error) -> Self {
+        BindError::Io(error)
+    }
+}
+
+/// Binds, unbinds and looks, one a packet: `B`, `U` or `Q`, the version,
+/// the direction (0 an input of the daemon's, 1 an output), the instance,
+/// the index, the remote stream's index, the remote entity's ID and, for
+/// a bind, the format to set first (0 to keep the stream's), each in
+/// little-endian order. The answer, `R`, has a status, an ACMP status
+/// where the listener refused, and the stream bound to, where there is
+/// one: its index, a flag, and its entity's ID.
+const BIND: u8 = b'B';
+const UNBIND: u8 = b'U';
+const BOUND: u8 = b'Q';
+const BIND_LEN: usize = 24;
+const BIND_ANSWER_LEN: usize = 16;
+/// The longest request the daemon reads.
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+const REQUEST_LEN: usize = 32;
+const DONE: u8 = ATTACHED;
+const NO_STREAM: u8 = 4;
+const FORMAT: u8 = 5;
+const REFUSED: u8 = 6;
+const NO_ANSWER: u8 = 7;
+const ELSEWHERE: u8 = 8;
+
+/// An app's bind, unbind or look at a binding, of the stream of the
+/// daemon's that `out` and `stream` name, as an attach names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+pub(crate) enum Asked {
+    /// Binds an input to the talker `remote`, or the listener `remote` to
+    /// an output, the stream set to `format` first where one is given.
+    Bind {
+        out: bool,
+        stream: StreamRef,
+        remote: Remote,
+        format: Option<u64>,
+    },
+    /// Unbinds an input from its talker, or the listener `remote` from an
+    /// output.
+    Unbind {
+        out: bool,
+        stream: StreamRef,
+        remote: Remote,
+    },
+    /// What an input is bound to, or a listener bound to an output.
+    Bound { out: bool, stream: StreamRef },
+}
+
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+impl Asked {
+    fn encode(self) -> [u8; BIND_LEN] {
+        let none = Remote {
+            entity: 0,
+            index: 0,
+        };
+        let (kind, out, stream, remote, format) = match self {
+            Asked::Bind {
+                out,
+                stream,
+                remote,
+                format,
+            } => (BIND, out, stream, remote, format.unwrap_or(0)),
+            Asked::Unbind {
+                out,
+                stream,
+                remote,
+            } => (UNBIND, out, stream, remote, 0),
+            Asked::Bound { out, stream } => (BOUND, out, stream, none, 0),
+        };
+        let mut message = [0u8; BIND_LEN];
+        message[0] = kind;
+        message[1] = VERSION as u8;
+        message[2] = u8::from(out);
+        message[3] = stream.instance;
+        message[4..6].copy_from_slice(&stream.index.to_le_bytes());
+        message[6..8].copy_from_slice(&remote.index.to_le_bytes());
+        message[8..16].copy_from_slice(&remote.entity.to_le_bytes());
+        message[16..24].copy_from_slice(&format.to_le_bytes());
+        message
+    }
+
+    pub(crate) fn decode(message: &[u8]) -> Option<Asked> {
+        let message: &[u8; BIND_LEN] = message.try_into().ok()?;
+        if u32::from(message[1]) != VERSION || message[2] > 1 {
+            return None;
+        }
+        let out = message[2] == 1;
+        let stream = StreamRef {
+            instance: message[3],
+            index: u16::from_le_bytes([message[4], message[5]]),
+        };
+        let octets = |at: usize| {
+            let mut value = [0u8; 8];
+            value.copy_from_slice(&message[at..at + 8]);
+            u64::from_le_bytes(value)
+        };
+        let remote = Remote {
+            index: u16::from_le_bytes([message[6], message[7]]),
+            entity: octets(8),
+        };
+        let format = octets(16);
+        match message[0] {
+            BIND => Some(Asked::Bind {
+                out,
+                stream,
+                remote,
+                format: (format != 0).then_some(format),
+            }),
+            UNBIND => Some(Asked::Unbind {
+                out,
+                stream,
+                remote,
+            }),
+            BOUND => Some(Asked::Bound { out, stream }),
+            _ => None,
+        }
+    }
+}
+
+/// How the daemon settled an app's bind, unbind or look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+pub(crate) enum Settled {
+    /// Done, with what the stream is bound to now.
+    Done(Option<Remote>),
+    NoStream,
+    Format,
+    /// The listener refused, with its ACMP status.
+    Refused(u8),
+    NoAnswer,
+    /// Bound to this talker by another controller.
+    Elsewhere(Remote),
+}
+
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+impl Settled {
+    pub(crate) fn encode(self) -> [u8; BIND_ANSWER_LEN] {
+        let (status, acmp, remote) = match self {
+            Settled::Done(remote) => (DONE, 0, remote),
+            Settled::NoStream => (NO_STREAM, 0, None),
+            Settled::Format => (FORMAT, 0, None),
+            Settled::Refused(status) => (REFUSED, status, None),
+            Settled::NoAnswer => (NO_ANSWER, 0, None),
+            Settled::Elsewhere(talker) => (ELSEWHERE, 0, Some(talker)),
+        };
+        let mut answer = [0u8; BIND_ANSWER_LEN];
+        answer[0] = ANSWER;
+        answer[1] = status;
+        answer[2] = acmp;
+        if let Some(remote) = remote {
+            answer[4..6].copy_from_slice(&remote.index.to_le_bytes());
+            answer[6] = 1;
+            answer[8..16].copy_from_slice(&remote.entity.to_le_bytes());
+        }
+        answer
+    }
+
+    /// An answer as an app reads it: an older daemon answers a request
+    /// it does not know as it would a bad attach, in 8 octets.
+    fn decode(answer: &[u8]) -> Result<Option<Remote>, BindError> {
+        if answer.is_empty() {
+            return Err(BindError::Io(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "the daemon closed the connection",
+            )));
+        }
+        if answer[0] != ANSWER {
+            return Err(BindError::Unknown);
+        }
+        if answer.get(1) == Some(&BAD_REQUEST) {
+            return Err(BindError::Unsupported);
+        }
+        let Ok(answer) = <&[u8; BIND_ANSWER_LEN]>::try_from(answer) else {
+            return Err(BindError::Unknown);
+        };
+        let mut entity = [0u8; 8];
+        entity.copy_from_slice(&answer[8..16]);
+        let remote = (answer[6] == 1).then(|| Remote {
+            index: u16::from_le_bytes([answer[4], answer[5]]),
+            entity: u64::from_le_bytes(entity),
+        });
+        match (answer[1], remote) {
+            (DONE, remote) => Ok(remote),
+            (NO_STREAM, _) => Err(BindError::NoStream),
+            (FORMAT, _) => Err(BindError::Format),
+            (REFUSED, _) => Err(BindError::Refused { status: answer[2] }),
+            (NO_ANSWER, _) => Err(BindError::NoAnswer),
+            (ELSEWHERE, Some(talker)) => Err(BindError::Elsewhere { talker }),
+            _ => Err(BindError::Unknown),
+        }
+    }
+}
+
 /// A packet socket on the Unix socket at `path`.
 fn connect(path: &Path) -> io::Result<OwnedFd> {
     let socket = seqpacket()?;
@@ -596,9 +858,14 @@ fn file_len(fd: BorrowedFd<'_>) -> io::Result<usize> {
 }
 
 /// A connection to the daemon's rings on an interface. Rings attached
-/// through it stay attached while any of them, or it, is kept.
+/// through it stay attached while any of them, or it, is kept. Through it
+/// too, an app binds its streams to other devices' with the daemon's
+/// controller.
 pub struct App {
     socket: Arc<OwnedFd>,
+    /// Held from a request to its answer, so that two threads asking at
+    /// once each read their own.
+    asking: Mutex<()>,
 }
 
 impl App {
@@ -617,7 +884,64 @@ impl App {
     pub fn connect_at(path: &Path) -> io::Result<App> {
         Ok(App {
             socket: Arc::new(connect(path)?),
+            asking: Mutex::new(()),
         })
+    }
+
+    /// Binds a stream of the daemon's entities to one on another device,
+    /// through the daemon's controller: an input (`out` false) to the
+    /// talker `remote`, as a BIND_RX given to the entity here, or the
+    /// listener `remote` to an output, as a BIND_RX sent to it. With
+    /// `format`, the stream is set to it first, as SET_STREAM_FORMAT
+    /// would set it: a Milan listener binds to a talker of another format
+    /// and gets no media. Waits for the listener's answer, half a second
+    /// at most from a Milan listener. An output's first bind starts the
+    /// daemon's controller where it is not running, which may take 3 s
+    /// more to find the listener. An input's binding is kept in the
+    /// configuration, as any controller's is.
+    pub fn bind(
+        &self,
+        out: bool,
+        stream: StreamRef,
+        remote: Remote,
+        format: Option<u64>,
+    ) -> Result<(), BindError> {
+        self.ask(Asked::Bind {
+            out,
+            stream,
+            remote,
+            format,
+        })
+        .map(|_| ())
+    }
+
+    /// Unbinds an input from whatever talker it is bound to, or the
+    /// listener `remote` from an output, as [`App::bind`] binds them. An
+    /// input bound to nothing is done with at once; a listener bound to
+    /// another talker is left be, as [`BindError::Elsewhere`].
+    pub fn unbind(&self, out: bool, stream: StreamRef, remote: Remote) -> Result<(), BindError> {
+        self.ask(Asked::Unbind {
+            out,
+            stream,
+            remote,
+        })
+        .map(|_| ())
+    }
+
+    /// The talker an input is bound to, or a listener bound to an output,
+    /// as far as the daemon's controller has read the network: none for
+    /// an output while the controller is not running, and the lowest
+    /// entity ID's where several listen.
+    pub fn bound(&self, out: bool, stream: StreamRef) -> Result<Option<Remote>, BindError> {
+        self.ask(Asked::Bound { out, stream })
+    }
+
+    fn ask(&self, asked: Asked) -> Result<Option<Remote>, BindError> {
+        let _asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
+        send(self.socket.as_fd(), &asked.encode(), &[])?;
+        let mut answer = [0u8; BIND_ANSWER_LEN];
+        let (len, _) = receive(self.socket.as_fd(), &mut answer)?;
+        Settled::decode(&answer[..len])
     }
 
     /// Attaches the ring of an input of the stream's entity, the network's
@@ -653,9 +977,11 @@ impl App {
     }
 
     fn attach(&self, out: bool, stream: StreamRef) -> Result<Attached, Error> {
+        let asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
         send(self.socket.as_fd(), &attach_message(out, stream), &[])?;
         let mut answer = [0u8; MESSAGE_LEN];
         let (len, mut fds) = receive(self.socket.as_fd(), &mut answer)?;
+        drop(asking);
         match (len, answer[0], answer[1]) {
             (MESSAGE_LEN, ANSWER, ATTACHED) if fds.len() == 2 => {}
             (MESSAGE_LEN, ANSWER, NO_RING) => return Err(Error::NoRing),
@@ -1147,5 +1473,85 @@ impl Outbound {
             presented,
             flags,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binds_go_over_the_socket_as_they_were_asked() {
+        let stream = StreamRef {
+            instance: 114,
+            index: 513,
+        };
+        let remote = Remote {
+            entity: 0xa010_a3ff_72a5_1726,
+            index: 2,
+        };
+        for asked in [
+            Asked::Bind {
+                out: false,
+                stream,
+                remote,
+                format: Some(0x0205_0220_0080_c000),
+            },
+            Asked::Bind {
+                out: true,
+                stream,
+                remote,
+                format: None,
+            },
+            Asked::Unbind {
+                out: true,
+                stream,
+                remote,
+            },
+            Asked::Bound { out: false, stream },
+        ] {
+            assert_eq!(Asked::decode(&asked.encode()), Some(asked));
+        }
+        let message = Asked::Bound { out: true, stream }.encode();
+        // Another version, direction or kind, or an attach: not a bind.
+        let mut other = message;
+        other[1] = 2;
+        assert_eq!(Asked::decode(&other), None);
+        other = message;
+        other[2] = 2;
+        assert_eq!(Asked::decode(&other), None);
+        other = message;
+        other[0] = b'A';
+        assert_eq!(Asked::decode(&other), None);
+        assert_eq!(Asked::decode(&attach_message(true, stream)), None);
+    }
+
+    #[test]
+    fn answers_say_what_was_settled() {
+        let remote = Remote {
+            entity: 0x0001_f2ff_feff_3b14,
+            index: 7,
+        };
+        let read = |settled: Settled| Settled::decode(&settled.encode());
+        assert_eq!(read(Settled::Done(Some(remote))).unwrap(), Some(remote));
+        assert_eq!(read(Settled::Done(None)).unwrap(), None);
+        assert!(matches!(
+            read(Settled::Refused(9)),
+            Err(BindError::Refused { status: 9 })
+        ));
+        assert!(matches!(
+            read(Settled::Elsewhere(remote)),
+            Err(BindError::Elsewhere { talker }) if talker == remote
+        ));
+        // An older daemon's answer to what it does not know.
+        assert!(matches!(
+            Settled::decode(&[ANSWER, BAD_REQUEST, 0, 0, 0, 0, 0, 0]),
+            Err(BindError::Unsupported)
+        ));
+        assert!(matches!(
+            Settled::decode(&[ANSWER, NO_RING, 0, 0, 0, 0, 0, 0]),
+            Err(BindError::Unknown)
+        ));
+        assert!(matches!(Settled::decode(&[]), Err(BindError::Io(_))));
     }
 }

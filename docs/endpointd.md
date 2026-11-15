@@ -459,6 +459,23 @@ ring_frames = 16384   # a power of two, 4096 to 262144; 16384 if left out
   wake interval, and trusts neither for where it reads or writes.
 - **The client** is `avb_endpointd::ring`, behind the `ring` feature,
   which needs libc alone.
+- **Binding** (the user, 2026-11-15, for lanears): an app with no
+  controller of its own binds its streams on the same socket, naming
+  its stream as it does to attach, and the other device's stream by
+  entity ID and index. An input is bound to a talker as the daemon's
+  controller's BIND_RX given to the entity here, at once, and kept in
+  the configuration as any controller's binding is. A listener is bound
+  to an output by the daemon's controller over the network, and the app
+  waits for its answer. An output's first bind starts the controller
+  where the configuration doesn't run it, and it may take 3 s to find
+  the listener. The app may name a format to set first, one the stream
+  offers: a Milan listener binds to a talker of another format and gets
+  no media. Unbinding undoes each. A listener the controller has read
+  bound to another talker is left be, either way, as another
+  controller's; the app hears whose. The app can also ask what an input
+  is bound to, or which listener the controller has read bound to an
+  output. A controller that only apps' binds started releases no
+  device's listeners, as one running for the network devices does.
 - **Later on the same socket:** vendor-defined CONTROLs and Scramble
   OUI vendor-unique AECP for an app's entity.
 

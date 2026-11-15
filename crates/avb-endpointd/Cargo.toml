@@ -41,13 +41,17 @@ path = "src/main.rs"
 required-features = ["daemon"]
 
 # For the smoke tests, in a namespace: a stand-in for gptpd, and the app
-# rings checked end to end.
+# rings and apps' binds checked end to end.
 [[example]]
 name = "fake_gptpd"
 required-features = ["daemon"]
 
 [[example]]
 name = "ring_check"
+required-features = ["ring"]
+
+[[example]]
+name = "ring_bind"
 required-features = ["ring"]
 
 # For an app's tests: a simulated room, and the least of an app.

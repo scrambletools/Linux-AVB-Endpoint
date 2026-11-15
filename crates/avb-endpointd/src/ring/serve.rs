@@ -13,8 +13,9 @@ use std::thread::JoinHandle;
 use avb_stream::audio::{Arrived, Block, BlockSink, BlockSource};
 
 use super::{
-    ANSWER, ATTACHED, BAD_REQUEST, Flags, MAGIC, MESSAGE_LEN, Map, NO_RING, NO_TIME, Shape,
-    StreamRef, TAKEN, VERSION, View, address, read_attach, receive, send, seqpacket, socket_path,
+    ANSWER, ATTACHED, Asked, BAD_REQUEST, Flags, MAGIC, Map, NO_RING, NO_TIME, REQUEST_LEN,
+    Settled, Shape, StreamRef, TAKEN, VERSION, View, address, read_attach, receive, send,
+    seqpacket, socket_path,
 };
 
 /// Inbound, a block presented further ahead than this counts as early.
@@ -380,6 +381,16 @@ impl Server {
 
     /// Serves `rings` on a socket at `path`.
     pub fn start_at(path: PathBuf, rings: Rings) -> io::Result<Server> {
+        Self::start_binding(path, rings, None)
+    }
+
+    /// Serves `rings` on a socket at `path`, handing apps' binds, unbinds
+    /// and looks to `binds`; without it, they are bad requests.
+    pub(crate) fn start_binding(
+        path: PathBuf,
+        rings: Rings,
+        binds: Option<Binds>,
+    ) -> io::Result<Server> {
         if let Some(folder) = path.parent() {
             std::fs::create_dir_all(folder)?;
         }
@@ -401,7 +412,7 @@ impl Server {
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("app rings".into())
-                .spawn(move || serve(&listener, &rings, &stop))?
+                .spawn(move || serve(&listener, &rings, binds.as_ref(), &stop))?
         };
         Ok(Server {
             stop,
@@ -421,6 +432,25 @@ impl Drop for Server {
     }
 }
 
+/// Where the socket's thread hands apps' binds, unbinds and looks, each
+/// with its answer to send: to the daemon's runtime, which has the
+/// entities and the controller.
+pub(crate) type Binds = Box<dyn Fn(Asked, Answer) + Send>;
+
+/// The answer to one app's bind, unbind or look, sent once from wherever
+/// it is settled: the app waits for it, and asks nothing else meanwhile.
+#[derive(Debug)]
+pub(crate) struct Answer {
+    socket: OwnedFd,
+}
+
+impl Answer {
+    pub(crate) fn send(self, settled: Settled) {
+        // An app gone meanwhile has no one to tell.
+        let _ = send(self.socket.as_fd(), &settled.encode(), &[]);
+    }
+}
+
 /// An app's connection, and the rings it attached: weakly, so a ring
 /// whose stream goes is dropped, and the app told, while it is attached.
 struct Client {
@@ -428,7 +458,7 @@ struct Client {
     attached: Vec<Weak<Ring>>,
 }
 
-fn serve(listener: &OwnedFd, rings: &Rings, stop: &AtomicBool) {
+fn serve(listener: &OwnedFd, rings: &Rings, binds: Option<&Binds>, stop: &AtomicBool) {
     let mut clients: Vec<Client> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         let mut polls: Vec<libc::pollfd> = std::iter::once(listener.as_raw_fd())
@@ -451,12 +481,14 @@ fn serve(listener: &OwnedFd, rings: &Rings, stop: &AtomicBool) {
             if events == 0 {
                 continue;
             }
-            let mut message = [0u8; MESSAGE_LEN];
+            let mut message = [0u8; REQUEST_LEN];
             let gone = if events & libc::POLLIN != 0 {
                 let received = receive(clients[place].socket.as_fd(), &mut message);
                 match received {
                     Ok((0, _)) | Err(_) => true,
-                    Ok((len, _)) => answer(&mut clients, place, &message[..len], rings).is_err(),
+                    Ok((len, _)) => {
+                        answer(&mut clients, place, &message[..len], rings, binds).is_err()
+                    }
                 }
             } else {
                 events & (libc::POLLHUP | libc::POLLERR) != 0
@@ -486,10 +518,21 @@ fn serve(listener: &OwnedFd, rings: &Rings, stop: &AtomicBool) {
     }
 }
 
-/// Answers an app's attach.
-fn answer(clients: &mut [Client], place: usize, message: &[u8], rings: &Rings) -> io::Result<()> {
+/// Answers an app's attach, or hands on its bind, unbind or look.
+fn answer(
+    clients: &mut [Client],
+    place: usize,
+    message: &[u8],
+    rings: &Rings,
+    binds: Option<&Binds>,
+) -> io::Result<()> {
     let reply = |status: u8| [ANSWER, status, 0, 0, 0, 0, 0, 0];
     let socket = clients[place].socket.as_fd();
+    if let (Some(asked), Some(binds)) = (Asked::decode(message), binds) {
+        let socket = socket.try_clone_to_owned()?;
+        binds(asked, Answer { socket });
+        return Ok(());
+    }
     let Some(key) = read_attach(message) else {
         return send(socket, &reply(BAD_REQUEST), &[]);
     };
@@ -520,7 +563,7 @@ fn answer(clients: &mut [Client], place: usize, message: &[u8], rings: &Rings) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ring::{App, Error, Flags as RingFlags};
+    use crate::ring::{App, BindError, Error, Flags as RingFlags, Remote};
     use std::time::Duration;
 
     /// A server on a socket of its own, with the given rings.
@@ -731,5 +774,105 @@ mod tests {
         drop(ring);
         let mut samples = Vec::new();
         assert!(matches!(input.next(&mut samples), Err(Error::Retired)));
+    }
+
+    /// A server whose binds `settle` answers, each from a thread of its
+    /// own as the runtime's would be, with what each asked sent back.
+    fn served_binding(
+        settle: fn(Asked) -> Settled,
+    ) -> (Server, PathBuf, std::sync::mpsc::Receiver<Asked>) {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "avb-bind-test-{}-{}.app",
+            std::process::id(),
+            COUNT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (asked_sender, asked) = std::sync::mpsc::channel();
+        let binds: Binds = Box::new(move |request, answer: Answer| {
+            let _ = asked_sender.send(request);
+            std::thread::spawn(move || answer.send(settle(request)));
+        });
+        let server = Server::start_binding(path.clone(), Rings::default(), Some(binds)).unwrap();
+        (server, path, asked)
+    }
+
+    const TALKER: Remote = Remote {
+        entity: 0x0001_f2ff_feff_3b14,
+        index: 3,
+    };
+
+    #[test]
+    fn an_app_binds_unbinds_and_looks_through_the_socket() {
+        let (_server, path, asked) = served_binding(|request| match request {
+            Asked::Bind { remote, .. } => Settled::Done(Some(remote)),
+            Asked::Unbind { .. } => Settled::Done(None),
+            Asked::Bound { .. } => Settled::Done(Some(TALKER)),
+        });
+        let app = App::connect_at(&path).unwrap();
+        app.bind(false, ROOM, TALKER, Some(0x0205_0220_0080_c000))
+            .unwrap();
+        assert_eq!(
+            asked.recv().unwrap(),
+            Asked::Bind {
+                out: false,
+                stream: ROOM,
+                remote: TALKER,
+                format: Some(0x0205_0220_0080_c000),
+            }
+        );
+        app.unbind(true, ROOM, TALKER).unwrap();
+        assert_eq!(
+            asked.recv().unwrap(),
+            Asked::Unbind {
+                out: true,
+                stream: ROOM,
+                remote: TALKER,
+            }
+        );
+        assert_eq!(app.bound(true, ROOM).unwrap(), Some(TALKER));
+        assert_eq!(
+            asked.recv().unwrap(),
+            Asked::Bound {
+                out: true,
+                stream: ROOM
+            }
+        );
+    }
+
+    #[test]
+    fn an_app_hears_why_a_bind_failed() {
+        let (_server, path, _asked) = served_binding(|request| match request {
+            Asked::Bind { remote, .. } => match remote.index {
+                0 => Settled::NoStream,
+                1 => Settled::Format,
+                2 => Settled::Refused(11),
+                3 => Settled::NoAnswer,
+                _ => Settled::Elsewhere(TALKER),
+            },
+            _ => Settled::Done(None),
+        });
+        let app = App::connect_at(&path).unwrap();
+        let bind = |index| app.bind(true, ROOM, Remote { entity: 1, index }, None);
+        assert!(matches!(bind(0), Err(BindError::NoStream)));
+        assert!(matches!(bind(1), Err(BindError::Format)));
+        assert!(matches!(bind(2), Err(BindError::Refused { status: 11 })));
+        assert!(matches!(bind(3), Err(BindError::NoAnswer)));
+        assert!(matches!(
+            bind(4),
+            Err(BindError::Elsewhere { talker: TALKER })
+        ));
+        assert_eq!(app.bound(false, ROOM).unwrap(), None);
+    }
+
+    #[test]
+    fn a_daemon_without_binds_says_so_and_still_attaches() {
+        let ring = Ring::new(false, 2, 1 << 12).unwrap();
+        let (_server, path) = served(&[((false, ROOM), ring.clone())]);
+        let app = App::connect_at(&path).unwrap();
+        assert!(matches!(
+            app.bind(false, ROOM, TALKER, None),
+            Err(BindError::Unsupported)
+        ));
+        assert!(app.inbound(ROOM).is_ok());
     }
 }

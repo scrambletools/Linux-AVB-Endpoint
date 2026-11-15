@@ -11,8 +11,8 @@ use std::sync::{Arc, PoisonError, Weak};
 use std::time::SystemTime;
 use std::time::{Duration, Instant as Clock};
 
-use atdecc::acmp::{AcmpFlags, AcmpMessageType, Acmpdu};
-use atdecc::controller::CommandId;
+use atdecc::acmp::{AcmpFlags, AcmpMessageType, AcmpStatus, Acmpdu};
+use atdecc::controller::{CommandId, Outcome, Refusal as CommandRefusal};
 use atdecc::entity::{
     ClockQuality, EndpointModel, Entity, EntityEvent, InputBinding, InputReservation,
     OutputReservation, StreamModel, UNADDRESSED,
@@ -50,8 +50,8 @@ use crate::meters::{self, Meters, StreamMeter};
 use crate::model::Identity;
 use crate::port::{Port, VLAN};
 use crate::profile;
-use crate::ring::StreamRef;
-use crate::ring::serve::{Ring, Rings, Server as RingServer};
+use crate::ring::serve::{Answer, Binds, Ring, Rings, Server as RingServer};
+use crate::ring::{Asked, Remote, Settled, StreamRef};
 use crate::sharing::{self, Server, Sharers};
 use crate::signal;
 use crate::status::{
@@ -212,6 +212,11 @@ const ASK_FIRST: Duration = Duration::from_millis(1500);
 const OFF_SYNC: u64 = 1_000_000;
 /// How often the daemon looks whether an app asks for the meters.
 const METERS_LOOK: Duration = Duration::from_millis(500);
+/// How long an app's bind of an output waits for the daemon's controller
+/// to find the listener, as it does when the bind started it: an entity
+/// answers ENTITY_DISCOVER within half a second, its descriptors read
+/// after.
+const FIND_LISTENER: Duration = Duration::from_secs(3);
 
 /// What the sockets and gptpd hand the runtime.
 enum Input {
@@ -231,6 +236,9 @@ enum Input {
     SharerClosed(u64),
     /// The configuration file was written, replaced, made or removed.
     ConfigTouched,
+    /// An app asked on the app socket to bind or unbind one of the
+    /// entities' streams, or what one is bound to, with its answer.
+    AppAsked(Asked, Answer),
 }
 
 /// Milan's media clock stream format: CRF, an audio sample clock at
@@ -1091,6 +1099,17 @@ pub struct Runtime {
     /// the daemon gives its own entity.
     connections: Connections,
     connecting: HashMap<CommandId, (RemoteStream, Out)>,
+    /// Apps' binds and unbinds of outputs: those waiting for the
+    /// controller to find their listener, until when, and those it is
+    /// carrying out, by its command.
+    app_waiting: Vec<(Duration, Asked, Answer)>,
+    app_commands: HashMap<CommandId, (Asked, Answer)>,
+    /// The listeners apps had bound to their outputs, each to which,
+    /// before the controller reads them so.
+    app_listeners: HashMap<(EntityId, u16), (EntityId, u16)>,
+    /// Whether an app's bind started the controller, which then runs
+    /// whatever the configuration wants.
+    app_controller: bool,
     /// Listeners on other devices the daemon asked to let go of one of
     /// its pool talkers, until the controller reads them unbound.
     releasing: HashSet<RemoteStream>,
@@ -1321,6 +1340,7 @@ impl Runtime {
             Input::SharerAsked,
             Input::SharerClosed,
         );
+        let app_sender = sender.clone();
         profile::watch(interface.clone(), stop.clone(), sender, Input::Link);
 
         let mac = avtp.mac();
@@ -1384,7 +1404,13 @@ impl Runtime {
             endpoint.make_missing_rings();
         }
         let rings = Rings::default();
-        let ring_server = match RingServer::start(&interface, rings.clone()) {
+        let binds: Binds = Box::new(move |asked: Asked, answer: Answer| {
+            let _ = app_sender.send(Input::AppAsked(asked, answer));
+        });
+        let ring_server = crate::ring::socket_path(&interface)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no XDG_RUNTIME_DIR"))
+            .and_then(|path| RingServer::start_binding(path, rings.clone(), Some(binds)));
+        let ring_server = match ring_server {
             Ok(server) => Some(server),
             Err(error) => {
                 log(format!("no socket for apps' rings: {error}"));
@@ -1456,6 +1482,10 @@ impl Runtime {
             network_devices: HashMap::new(),
             connections: Connections::new(u16::from(pools.0), u16::from(pools.1)),
             connecting: HashMap::new(),
+            app_waiting: Vec::new(),
+            app_commands: HashMap::new(),
+            app_listeners: HashMap::new(),
+            app_controller: false,
             releasing: HashSet::new(),
             own_sequence: 0,
             meters_wanted: false,
@@ -1820,7 +1850,7 @@ impl Runtime {
     /// Starts the daemon's controller where the file wants any network
     /// device, and stops it where it wants none.
     fn update_discovery(&mut self) {
-        let wanted = self.config.wants_devices();
+        let wanted = self.config.wants_devices() || self.app_controller;
         if wanted && self.discovery.is_none() {
             self.discovery = Some(Discovery::new(self.mac));
         } else if !wanted {
@@ -1841,7 +1871,11 @@ impl Runtime {
         let now = self.now();
         let since = self.elapsed();
         self.check_pool_listeners();
-        self.release_stale(now);
+        // A controller only apps' binds started looks after no device's
+        // listeners.
+        if self.config.wants_devices() {
+            self.release_stale(now);
+        }
         let seen: Vec<Seen> = devices::statuses(&self.config, &self.found)
             .into_iter()
             .filter(|status| status.shown)
@@ -1875,7 +1909,13 @@ impl Runtime {
             .as_mut()
             .map(Discovery::take_finished)
             .unwrap_or_default();
-        for (command, done) in finished {
+        for (command, outcome) in finished {
+            if let Some((asked, answer)) = self.app_commands.remove(&command) {
+                let settled = self.app_settled(asked, outcome);
+                answer.send(settled);
+                continue;
+            }
+            let done = outcome == Outcome::Done;
             let Some((stream, out)) = self.connecting.remove(&command) else {
                 continue;
             };
@@ -2196,6 +2236,320 @@ impl Runtime {
             }
         }
         self.log_released(stream);
+    }
+
+    /// Takes an app's bind, unbind or look from the app socket: an
+    /// input's at once, with the entity here; an output's once the
+    /// controller, started for it where it is not running, has found the
+    /// listener, and the listener answered.
+    fn app_asked(&mut self, asked: Asked, answer: Answer) {
+        match asked {
+            Asked::Bound { out, stream } => answer.send(self.app_bound(out, stream)),
+            Asked::Bind {
+                out: false,
+                stream,
+                remote,
+                format,
+            } => answer.send(self.bind_input(stream, Some((remote, format)))),
+            Asked::Unbind {
+                out: false, stream, ..
+            } => answer.send(self.bind_input(stream, None)),
+            Asked::Bind { stream, format, .. } => {
+                self.ask_controller(asked, answer, stream, format)
+            }
+            Asked::Unbind { stream, .. } => self.ask_controller(asked, answer, stream, None),
+        }
+    }
+
+    /// Queues an app's bind or unbind of an output for the controller,
+    /// starting the controller where it is not running, with the output
+    /// set to `format` first where one is given.
+    fn ask_controller(
+        &mut self,
+        asked: Asked,
+        answer: Answer,
+        stream: StreamRef,
+        format: Option<u64>,
+    ) {
+        let Some((index, output)) = self.app_stream(true, stream) else {
+            answer.send(Settled::NoStream);
+            return;
+        };
+        if let Some(format) = format
+            && !self.set_app_format(index, true, output, StreamFormat(format))
+        {
+            answer.send(Settled::Format);
+            return;
+        }
+        if self.discovery.is_none() {
+            self.app_controller = true;
+            self.update_discovery();
+            log("controller started, for an app's bind");
+        }
+        self.app_waiting
+            .push((self.elapsed() + FIND_LISTENER, asked, answer));
+        self.drive_app_binds();
+    }
+
+    /// Gives the controller each app's bind or unbind of an output whose
+    /// listener it has found, and answers those it did not find in time.
+    /// A listener the controller read bound to another talker is left be,
+    /// as another controller's, unless an app bound it to this one since;
+    /// one it read bound to the output already is bound at once.
+    fn drive_app_binds(&mut self) {
+        if self.app_waiting.is_empty() {
+            return;
+        }
+        let since = self.elapsed();
+        let now = self.now();
+        for (until, asked, answer) in std::mem::take(&mut self.app_waiting) {
+            let (stream, remote, bind) = match asked {
+                Asked::Bind { stream, remote, .. } => (stream, remote, true),
+                Asked::Unbind { stream, remote, .. } => (stream, remote, false),
+                Asked::Bound { .. } => continue,
+            };
+            let listener = (EntityId(remote.entity), remote.index);
+            let known = self
+                .discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.knows(listener.0));
+            if !known {
+                if since < until && self.discovery.is_some() {
+                    self.app_waiting.push((until, asked, answer));
+                } else {
+                    answer.send(Settled::NoAnswer);
+                }
+                continue;
+            }
+            let Some((index, output)) = self.app_stream(true, stream) else {
+                answer.send(Settled::NoStream);
+                continue;
+            };
+            let talker = (self.endpoints[index].entity.entity_id(), output);
+            let bound_to = self
+                .found
+                .iter()
+                .find(|found| found.stream == RemoteStream::destination(listener.0, listener.1))
+                .and_then(|found| found.bound_to);
+            let ours = self.app_listeners.get(&listener) == Some(&talker);
+            if let Some(other) = bound_to.filter(|other| *other != talker)
+                && !ours
+            {
+                answer.send(Settled::Elsewhere(Remote {
+                    entity: other.0.0,
+                    index: other.1,
+                }));
+                continue;
+            }
+            if bind && bound_to == Some(talker) {
+                answer.send(Settled::Done(Some(remote)));
+                continue;
+            }
+            let Some(discovery) = &mut self.discovery else {
+                answer.send(Settled::NoAnswer);
+                continue;
+            };
+            let command = if bind {
+                discovery.connect(now, talker, listener)
+            } else {
+                discovery.disconnect(now, listener)
+            };
+            self.app_commands.insert(command, (asked, answer));
+        }
+    }
+
+    /// What an app's bind or unbind of an output came to, as the
+    /// controller's command finished, remembered until the controller
+    /// reads the listener so.
+    fn app_settled(&mut self, asked: Asked, outcome: Outcome) -> Settled {
+        let (bind, stream, remote) = match asked {
+            Asked::Bind { stream, remote, .. } => (true, stream, remote),
+            Asked::Unbind { stream, remote, .. } => (false, stream, remote),
+            Asked::Bound { .. } => return Settled::NoAnswer,
+        };
+        let listener = (EntityId(remote.entity), remote.index);
+        if outcome == Outcome::Done {
+            let talker = self
+                .app_stream(true, stream)
+                .map(|(index, output)| (self.endpoints[index].entity.entity_id(), output));
+            match talker {
+                Some(talker) if bind => {
+                    self.app_listeners.insert(listener, talker);
+                }
+                _ => {
+                    self.app_listeners.remove(&listener);
+                }
+            }
+        }
+        let name = self.stream_name(&RemoteStream::destination(
+            EntityId(remote.entity),
+            remote.index,
+        ));
+        let what = if bind { "bind" } else { "unbind" };
+        match outcome {
+            Outcome::Done => {
+                log(format!("{name}: an app's {what} done"));
+                Settled::Done(bind.then_some(remote))
+            }
+            Outcome::Refused(refusal) => {
+                log(format!("{name}: an app's {what} refused, {refusal:?}"));
+                Settled::Refused(match refusal {
+                    CommandRefusal::Acmp(status) => status.0,
+                    CommandRefusal::Aem(_) => AcmpStatus::NOT_SUPPORTED.0,
+                })
+            }
+            Outcome::NoResponse | Outcome::NotPossible => {
+                log(format!("{name}: an app's {what} had no answer"));
+                Settled::NoAnswer
+            }
+        }
+    }
+
+    /// The talker an app's input is bound to, or the listener the
+    /// controller read bound to an app's output, the lowest entity ID's
+    /// where several are.
+    fn app_bound(&self, out: bool, stream: StreamRef) -> Settled {
+        let Some((index, at)) = self.app_stream(out, stream) else {
+            return Settled::NoStream;
+        };
+        let entity = &self.endpoints[index].entity;
+        if !out {
+            return Settled::Done(entity.input_binding(at).map(|binding| Remote {
+                entity: binding.talker.0,
+                index: binding.talker_unique_id,
+            }));
+        }
+        let talker = (entity.entity_id(), at);
+        let listener = self
+            .found
+            .iter()
+            .filter(|found| found.stream.way == Way::Destination && found.bound_to == Some(talker))
+            .map(|found| Remote {
+                entity: found.stream.entity.0,
+                index: found.stream.index,
+            })
+            .min();
+        Settled::Done(listener)
+    }
+
+    /// Binds an app's input to its talker, or unbinds it from whatever
+    /// talker it is bound to, as BIND_RX or UNBIND_RX from the daemon's
+    /// controller given to the entity here: done at once, with nothing
+    /// sent but the entity's answer, and kept in the configuration as any
+    /// controller's binding is.
+    fn bind_input(&mut self, stream: StreamRef, bind: Option<(Remote, Option<u64>)>) -> Settled {
+        let Some((index, input)) = self.app_stream(false, stream) else {
+            return Settled::NoStream;
+        };
+        let binding = |runtime: &Self| {
+            runtime.endpoints[index]
+                .entity
+                .input_binding(input)
+                .map(|binding| Remote {
+                    entity: binding.talker.0,
+                    index: binding.talker_unique_id,
+                })
+        };
+        let name = format!("{} input {}", self.endpoints[index].config.name, input + 1);
+        let Some((remote, format)) = bind else {
+            let Some(talker) = binding(self) else {
+                return Settled::Done(None);
+            };
+            self.own_acmp(
+                index,
+                AcmpMessageType::UNBIND_RX_COMMAND,
+                (EntityId(talker.entity), talker.index),
+                input,
+            );
+            if binding(self).is_some() {
+                return Settled::Refused(AcmpStatus::NOT_SUPPORTED.0);
+            }
+            log(format!("{name}: unbound, for an app"));
+            return Settled::Done(None);
+        };
+        if let Some(format) = format
+            && !self.set_app_format(index, false, input, StreamFormat(format))
+        {
+            return Settled::Format;
+        }
+        if binding(self) == Some(remote) {
+            return Settled::Done(Some(remote));
+        }
+        self.own_acmp(
+            index,
+            AcmpMessageType::BIND_RX_COMMAND,
+            (EntityId(remote.entity), remote.index),
+            input,
+        );
+        if binding(self) != Some(remote) {
+            return Settled::Refused(AcmpStatus::NOT_SUPPORTED.0);
+        }
+        log(format!(
+            "{name}: bound to 0x{:016x} output {}, for an app",
+            remote.entity, remote.index
+        ));
+        Settled::Done(Some(remote))
+    }
+
+    /// Sets an app's stream to `format` where the stream offers it, as a
+    /// controller's SET_STREAM_FORMAT would: whether it has it now. A
+    /// talker sending starts again in it.
+    fn set_app_format(&mut self, index: usize, out: bool, at: u16, format: StreamFormat) -> bool {
+        let stream = |runtime: &Self| {
+            let model = runtime.endpoints[index].entity.model();
+            let streams = if out { &model.outputs } else { &model.inputs };
+            streams
+                .get(usize::from(at))
+                .map(|stream| (stream.current_format, stream.formats.clone()))
+        };
+        let Some((current, offered)) = stream(self) else {
+            return false;
+        };
+        if current == format {
+            return true;
+        }
+        if !offered.iter().any(|offered| offered.admits(format)) {
+            return false;
+        }
+        let descriptor_type = if out {
+            atdecc::DescriptorType::STREAM_OUTPUT
+        } else {
+            atdecc::DescriptorType::STREAM_INPUT
+        };
+        self.set_own_format(index, descriptor_type, at, format);
+        if stream(self).map(|(current, _)| current) != Some(format) {
+            return false;
+        }
+        if out && self.output(Out(index, at)).talker.is_some() {
+            self.start_talker(Out(index, at));
+        }
+        true
+    }
+
+    /// The endpoint and stream an app names by its entity's instance and
+    /// its place, unless it is one of the default entity's pool streams,
+    /// which the daemon connects itself.
+    fn app_stream(&self, out: bool, stream: StreamRef) -> Option<(usize, u16)> {
+        let index = self
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.config.instance_at(endpoint.place) == stream.instance)?;
+        let endpoint = &self.endpoints[index];
+        let count = if out {
+            endpoint.outputs.len()
+        } else {
+            endpoint.inputs.len()
+        };
+        let pool = (0u16..)
+            .map_while(|pool| {
+                if out {
+                    endpoint.pool_output(pool)
+                } else {
+                    endpoint.pool_input(pool)
+                }
+            })
+            .any(|at| at == stream.index);
+        (usize::from(stream.index) < count && !pool).then_some((index, stream.index))
     }
 
     /// Gives input `input` of entity `index` an ACMP command from the
@@ -3030,6 +3384,7 @@ impl Runtime {
                 }
             }
             Input::SharerAsked(id, request) => self.sharer_asked(id, request),
+            Input::AppAsked(asked, answer) => self.app_asked(asked, answer),
             Input::SharerClosed(id) => {
                 let closed = self.sharers.close(id);
                 for declaration in closed.streams {
@@ -3090,6 +3445,7 @@ impl Runtime {
             self.sync_network_devices();
         }
         self.drive_connections();
+        self.drive_app_binds();
         for endpoint in &mut self.endpoints {
             endpoint.entity.handle_timeout(now);
         }
