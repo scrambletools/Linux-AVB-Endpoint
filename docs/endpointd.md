@@ -476,6 +476,7 @@ ring_frames = 16384   # a power of two, 4096 to 262144; 16384 if left out
   is bound to, or which listener the controller has read bound to an
   output. A controller that only apps' binds started releases no
   device's listeners, as one running for the network devices does.
+  Released in avb-endpointd 0.3.2.
 - **Later on the same socket:** vendor-defined CONTROLs and Scramble
   OUI vendor-unique AECP for an app's entity.
 
