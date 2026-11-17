@@ -13,7 +13,7 @@ readme = "README.md"
 # The protocol and stream crates, from scrambletools/avb on crates.io. A
 # git-ignored .cargo/avb-local.toml can point them at a checkout (see
 # README.md).
-atdecc = { version = "0.2.2", default-features = false }
+atdecc = { version = "0.2.3", default-features = false }
 avb-mrp = { version = "0.1.6", default-features = false }
 avb-net = { version = "0.1.6", default-features = false }
 avb-stream = "0.4.0"
@@ -26,3 +26,12 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# atdecc 0.2.3, with the log reader, is on scrambletools/avb main but not
+# yet on crates.io: until it is released, the avb crates come from that
+# commit, all four, so there is one of each. The release takes this out.
+[patch.crates-io]
+atdecc = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
+avb-mrp = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
+avb-net = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
+avb-stream = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }

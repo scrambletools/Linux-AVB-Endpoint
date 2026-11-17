@@ -51,9 +51,8 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "atdecc"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9abcb607f3eb4722a1770bf7cd489da633f7fee18aa3464451eda58687baff49"
+version = "0.2.3"
+source = "git+https://github.com/scrambletools/avb?rev=bad9ce709a98201af6bdcffc2ab2dcd8864b47c5#bad9ce709a98201af6bdcffc2ab2dcd8864b47c5"
 dependencies = [
  "avb-mrp",
  "avb-net",
@@ -87,8 +86,7 @@ dependencies = [
 [[package]]
 name = "avb-mrp"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b0ba64117540c5d0295af103f2630b0e5c7e7e3f45badbee76a85d0c4774a3b"
+source = "git+https://github.com/scrambletools/avb?rev=bad9ce709a98201af6bdcffc2ab2dcd8864b47c5#bad9ce709a98201af6bdcffc2ab2dcd8864b47c5"
 dependencies = [
  "avb-net",
 ]
@@ -96,8 +94,7 @@ dependencies = [
 [[package]]
 name = "avb-net"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "394a1f77d62d102b0f0ee99e6c3dae3c240c635b785b76510c38d423b07ccaa5"
+source = "git+https://github.com/scrambletools/avb?rev=bad9ce709a98201af6bdcffc2ab2dcd8864b47c5#bad9ce709a98201af6bdcffc2ab2dcd8864b47c5"
 dependencies = [
  "libc",
  "raw-ether",
@@ -121,8 +118,7 @@ dependencies = [
 [[package]]
 name = "avb-stream"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2a664bb38e50b261d4335e2d13e3b3d770a274e66413685cdcbe22d82d3e44"
+source = "git+https://github.com/scrambletools/avb?rev=bad9ce709a98201af6bdcffc2ab2dcd8864b47c5#bad9ce709a98201af6bdcffc2ab2dcd8864b47c5"
 dependencies = [
  "atdecc",
  "avb-net",
