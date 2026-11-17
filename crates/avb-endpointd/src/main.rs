@@ -20,6 +20,7 @@ use avb_endpointd::config::{self, Config};
 use avb_endpointd::status::{EXIT_BAD_CONFIG, EXIT_NO_INTERFACE, EXIT_REFUSED, EXIT_USAGE};
 use avb_endpointd::{profile, runtime, status, store};
 
+mod log_tool;
 mod tool;
 
 use tool::USAGE;
@@ -34,6 +35,8 @@ fn main() -> ExitCode {
         match argument.as_str() {
             "--config" => path = arguments.next().map(PathBuf::from),
             "--interface" => interface = arguments.next(),
+            // The log command's own options and devices.
+            word if command.as_deref() == Some("log") => words.push(word.to_owned()),
             "--version" | "-V" => {
                 println!("avb-endpointd {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
@@ -54,6 +57,9 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     };
+    if command.as_deref() == Some("log") {
+        return log_tool::run(&words, &interface);
+    }
     if let Some(command) = command {
         return tool::run(&command, &words, &interface, path);
     }

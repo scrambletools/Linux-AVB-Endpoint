@@ -46,6 +46,12 @@ required-features = ["daemon"]
 name = "fake_gptpd"
 required-features = ["daemon"]
 
+# For the log command's smoke test: an entity keeping a log as the ESP32
+# boards do.
+[[example]]
+name = "fake_board"
+required-features = ["daemon"]
+
 [[example]]
 name = "ring_check"
 required-features = ["ring"]

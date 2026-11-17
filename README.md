@@ -36,6 +36,7 @@ network. Without one, the daemon's own command does:
 avb-endpointd on --interface enp2s0      # start it now and at each login
 avb-endpointd list --interface enp2s0    # speakers and microphones found
 avb-endpointd off --interface enp2s0
+avb-endpointd log esp-mic --follow --interface enp2s0   # a device's log
 ```
 
 Each speaker or amp input found on the network gets a playback device
@@ -49,6 +50,12 @@ either.
 On this branch a destination connects as an app plays into it and
 lets go 30 s after; a source does not connect yet
 ([docs/endpointd.md](docs/endpointd.md)).
+
+`log` prints the log a device keeps for controllers to read, such as an
+ESP32 board's console without its cable: a LOG_OBJECT memory object,
+read through Address Access, named by the device's entity name or ID.
+`--follow` keeps reading and `--stats` says what the reading costs. A
+device is asked nothing unless it runs.
 
 ## The files
 
