@@ -52,7 +52,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 [[package]]
 name = "atdecc"
 version = "0.2.3"
-source = "git+https://github.com/scrambletools/avb?rev=dc3c67b6806782dc2d41f2813f0d57323202689e#dc3c67b6806782dc2d41f2813f0d57323202689e"
+source = "git+https://github.com/scrambletools/avb?rev=fba9e02f2f3b68121bd4ac526cd0ab70be4ff567#fba9e02f2f3b68121bd4ac526cd0ab70be4ff567"
 dependencies = [
  "avb-mrp",
  "avb-net",
@@ -86,7 +86,7 @@ dependencies = [
 [[package]]
 name = "avb-mrp"
 version = "0.1.6"
-source = "git+https://github.com/scrambletools/avb?rev=dc3c67b6806782dc2d41f2813f0d57323202689e#dc3c67b6806782dc2d41f2813f0d57323202689e"
+source = "git+https://github.com/scrambletools/avb?rev=fba9e02f2f3b68121bd4ac526cd0ab70be4ff567#fba9e02f2f3b68121bd4ac526cd0ab70be4ff567"
 dependencies = [
  "avb-net",
 ]
@@ -94,7 +94,7 @@ dependencies = [
 [[package]]
 name = "avb-net"
 version = "0.1.6"
-source = "git+https://github.com/scrambletools/avb?rev=dc3c67b6806782dc2d41f2813f0d57323202689e#dc3c67b6806782dc2d41f2813f0d57323202689e"
+source = "git+https://github.com/scrambletools/avb?rev=fba9e02f2f3b68121bd4ac526cd0ab70be4ff567#fba9e02f2f3b68121bd4ac526cd0ab70be4ff567"
 dependencies = [
  "libc",
  "raw-ether",
@@ -118,7 +118,7 @@ dependencies = [
 [[package]]
 name = "avb-stream"
 version = "0.4.0"
-source = "git+https://github.com/scrambletools/avb?rev=dc3c67b6806782dc2d41f2813f0d57323202689e#dc3c67b6806782dc2d41f2813f0d57323202689e"
+source = "git+https://github.com/scrambletools/avb?rev=fba9e02f2f3b68121bd4ac526cd0ab70be4ff567#fba9e02f2f3b68121bd4ac526cd0ab70be4ff567"
 dependencies = [
  "atdecc",
  "avb-net",

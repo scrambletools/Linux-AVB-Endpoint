@@ -21,6 +21,7 @@ use avb_endpointd::status::{EXIT_BAD_CONFIG, EXIT_NO_INTERFACE, EXIT_REFUSED, EX
 use avb_endpointd::{profile, runtime, status, store};
 
 mod crash_tool;
+mod firmware_tool;
 mod log_tool;
 mod tool;
 mod tool_net;
@@ -37,8 +38,9 @@ fn main() -> ExitCode {
         match argument.as_str() {
             "--config" => path = arguments.next().map(PathBuf::from),
             "--interface" => interface = arguments.next(),
-            // The log and crash commands' own options and devices.
-            word if matches!(command.as_deref(), Some("log" | "crash")) => {
+            // The log, crash and firmware commands' own options, devices
+            // and files.
+            word if matches!(command.as_deref(), Some("log" | "crash" | "firmware")) => {
                 words.push(word.to_owned());
             }
             "--version" | "-V" => {
@@ -66,6 +68,9 @@ fn main() -> ExitCode {
     }
     if command.as_deref() == Some("crash") {
         return crash_tool::run(&words, &interface);
+    }
+    if command.as_deref() == Some("firmware") {
+        return firmware_tool::run(&words, &interface);
     }
     if let Some(command) = command {
         return tool::run(&command, &words, &interface, path);

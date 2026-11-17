@@ -38,6 +38,7 @@ avb-endpointd list --interface enp2s0    # speakers and microphones found
 avb-endpointd off --interface enp2s0
 avb-endpointd log esp-mic --follow --interface enp2s0   # a device's log
 avb-endpointd crash esp-mic --interface enp2s0          # its crash dump
+avb-endpointd firmware esp-mic new.bin --interface enp2s0   # new firmware
 ```
 
 Each speaker or amp input found on the network gets a playback device
@@ -61,6 +62,10 @@ device is asked nothing unless it runs.
 memory object, to a file (`-o`), and `--erase` erases it after. An ESP32
 board's is ESP-IDF's core dump, which `esp-coredump` reads with the
 crashed firmware's ELF.
+`firmware` uploads a firmware image to a device as IEEE 1722.1-2021
+Annex D has it, as Hive does, and says whether the device came back
+running it or rolled back. A device whose streams run refuses unless
+`--stop-streams` lets it stop them (LOCK_ENTITY) for the upload.
 
 ## The files
 
