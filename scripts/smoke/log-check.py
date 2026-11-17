@@ -9,6 +9,7 @@ followed. The case decides what else must hold.
 """
 
 import json
+import re
 import sys
 
 
@@ -25,7 +26,8 @@ def main():
     read = lines(read_path)
     if name is not None:
         read = [line[len(name) + 2:] for line in read if line.startswith(name + ": ")]
-    markers = [line for line in read if line.startswith("[")]
+    boots = [line for line in read if re.match(r"^\[.*: boot [0-9a-f]{8}, up \d+ s, ", line)]
+    markers = [line for line in read if line.startswith("[") and line not in boots]
     text = [line for line in read if not line.startswith("[")]
     problems = []
 
@@ -46,6 +48,10 @@ def main():
     lost = [m for m in markers if "lost" in m]
     restarted = [m for m in markers if "restarted" in m]
     dropped = [m for m in markers if "dropped" in m]
+    if case in ("follow", "once") and len(boots) != 1:
+        problems.append(f"boot lines: {boots}")
+    if case == "restart" and len(boots) != 2:
+        problems.append(f"boot lines: {boots}")
     if case in ("follow", "once", "two"):
         if markers:
             problems.append(f"unexpected markers: {markers}")
@@ -68,7 +74,7 @@ def main():
 
     label = f"{case}{' ' + name if name else ''}"
     print(f"{label}: {len(text)} lines read, {len(board)} written, markers {markers[:3]}"
-          f"{' ...' if len(markers) > 3 else ''}")
+          f"{' ...' if len(markers) > 3 else ''}, boots {boots}")
     for problem in problems[:10]:
         print(f"FAIL {label}: {problem}")
     return 1 if problems else 0

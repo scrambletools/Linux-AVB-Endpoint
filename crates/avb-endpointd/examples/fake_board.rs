@@ -10,6 +10,7 @@
 //!              [--crash-dump OCTETS] [--crash-max OCTETS] [--crash-file PATH]
 //!              [--firmware-max OCTETS] [--version TEXT] [--streams-running]
 //!              [--reject-images] [--rollback-after SECONDS]
+//!              [--reset-reason N] [--resets N]
 //!   fake_board --make-image FILE [--version TEXT] [--size OCTETS]
 //!              [--project NAME] [--signed KEYS]
 //!
@@ -34,6 +35,11 @@
 //! refuse an upload unless locked, and `--rollback-after` has a new image
 //! restart in the old that long after it started. `--make-image` writes
 //! such an image, `--signed` with that many signature blocks after it.
+//!
+//! `--reset-reason` and `--resets` put why its first boot began and how
+//! many began unexpectedly in its log's header, as an ESP32 board's;
+//! later boots it starts itself begin for SW, a rollback's for TASK_WDT,
+//! which counts.
 
 use std::io::Write;
 use std::path::Path;
@@ -66,6 +72,8 @@ struct Options {
     size: usize,
     project: String,
     signed: usize,
+    reset_reason: Option<u8>,
+    resets: u16,
 }
 
 const USAGE: &str = "usage: fake_board --interface NAME [--name NAME] [--instance N] \
@@ -76,6 +84,10 @@ const USAGE: &str = "usage: fake_board --interface NAME [--name NAME] [--instanc
                      [--streams-running] [--reject-images] [--rollback-after SECONDS]\n\
                      \x20      fake_board --make-image FILE [--version TEXT] [--size OCTETS] \
                      [--project NAME] [--signed KEYS]";
+
+/// esp_reset_reason_t's SW and TASK_WDT.
+const SW: u8 = 3;
+const TASK_WDT: u8 = 6;
 
 /// The project its images are of.
 const PROJECT: &str = "fake_board";
@@ -104,6 +116,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         size: 65536,
         project: PROJECT.into(),
         signed: 0,
+        reset_reason: None,
+        resets: 0,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -139,6 +153,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--size" => options.size = number(value()?)? as usize,
             "--project" => options.project = value()?.clone(),
             "--signed" => options.signed = number(value()?)? as usize,
+            "--reset-reason" => options.reset_reason = Some(number(value()?)? as u8),
+            "--resets" => options.resets = number(value()?)? as u16,
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -240,7 +256,9 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
         options.version,
         sha9(&elf_sha256(&options.version, &options.project, 0))
     );
-    let mut entity = board(options, mac, &running, booted, boot, dump.clone());
+    // Why each boot began and how many began unexpectedly, if it says.
+    let mut reset = options.reset_reason.map(|reason| (reason, options.resets));
+    let mut entity = board(options, mac, &running, booted, boot, dump.clone(), reset);
     // A new image kept and its boot due, and the image it replaced with
     // when to go back to it.
     let mut staged: Option<String> = None;
@@ -291,6 +309,10 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
             boot += 1;
             // A new boot: a fresh log, from its own zero.
             entity.keep_log(now, options.ring, boot);
+            reset = reset.map(|(_, resets)| (SW, resets));
+            if let Some((reason, resets)) = reset {
+                entity.set_log_reset(reason, resets);
+            }
             booted = now;
             number = 0;
         }
@@ -317,7 +339,10 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
             if let Some(old) = back {
                 running = old;
                 rollback = None;
+                // A new image that never kept itself: the watchdog.
+                reset = reset.map(|(_, resets)| (TASK_WDT, resets.saturating_add(1)));
             } else if let Some(new) = staged.take() {
+                reset = reset.map(|(_, resets)| (SW, resets));
                 if let Some(after) = options.rollback_after {
                     rollback = Some((running.clone(), now + after));
                 }
@@ -327,7 +352,7 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
             boot += 1;
             booted = now;
             number = 0;
-            entity = board(options, mac, &running, now, boot, dump.clone());
+            entity = board(options, mac, &running, now, boot, dump.clone(), reset);
         }
         entity.handle_timeout(now);
         if now >= next_line {
@@ -371,9 +396,13 @@ fn board(
     now: Instant,
     boot: u32,
     dump: Option<Vec<u8>>,
+    reset: Option<(u8, u16)>,
 ) -> Entity {
     let mut entity = Entity::new(model(options, mac, version), &[]);
     entity.keep_log(now, options.ring, boot);
+    if let Some((reason, resets)) = reset {
+        entity.set_log_reset(reason, resets);
+    }
     if let Some(dump) = dump {
         entity.keep_crash_dump(options.crash_max.unwrap_or(256 * 1024), dump);
     }

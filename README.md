@@ -56,8 +56,10 @@ lets go 30 s after; a source does not connect yet
 `log` prints the log a device keeps for controllers to read, such as an
 ESP32 board's console without its cable: a LOG_OBJECT memory object,
 read through Address Access, named by the device's entity name or ID.
-`--follow` keeps reading and `--stats` says what the reading costs. A
-device is asked nothing unless it runs.
+`--follow` keeps reading and `--stats` says what the reading costs. It
+says each boot it reads, and, where the device tells, why that boot
+began and how many began unexpectedly. A device is asked nothing unless
+it runs.
 `crash` saves the crash dump a device keeps the same way, a CRASH_DUMP
 memory object, to a file (`-o`), and `--erase` erases it after. An ESP32
 board's is ESP-IDF's core dump, which `esp-coredump` reads with the

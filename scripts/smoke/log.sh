@@ -5,7 +5,8 @@
 # log-check.py compares what was read with what the board wrote.
 #
 # - follow: a boot burst, then lines, followed with --stats and
-#   --stats-json; every line read, in order, none lost, no retries.
+#   --stats-json; every line read, in order, none lost, no retries; the
+#   boot said first, with why it began.
 # - once: without --follow it reads what the log holds and stops.
 # - lost: a small ring read slowly loses octets, says so, and every
 #   line it prints is still one the board wrote.
@@ -79,12 +80,15 @@ verdict() {
 }
 
 # follow
-start_board follow --name fake-board --burst 6000 --rate 20 --line 60
+start_board follow --name fake-board --burst 6000 --rate 20 --line 60 --reset-reason 4 --resets 3
 follow_for follow 8 fake-board --follow --stats --stats-json "$work/follow.json"
 stop_boards
 cat "$work/follow.err"
 cat "$work/follow.json"
 verdict $check follow "$work/follow.board" "$work/follow.read" "$work/follow.json" 200
+grep -q "^\[fake-board: boot [0-9a-f]\{8\}, up [0-9]* s, reset PANIC (4), 3 unexpected resets\]$" "$work/follow.read" \
+    || { echo "FAIL follow: no boot line with its reset"; failed=1; }
+grep -q '"reset_reason":4,"resets":3' "$work/follow.json" || { echo "FAIL follow: reset not in the stats"; failed=1; }
 
 # once
 start_board once --name fake-board --instance 49 --burst 3000 --rate 2
@@ -101,6 +105,8 @@ if [ "$status" -ne 0 ] || [ "$took" -gt 5 ]; then
     failed=1
 fi
 verdict $check once "$work/once.board" "$work/once.read" - 50
+grep -q "^\[fake-board: boot [0-9a-f]\{8\}, up [0-9]* s, reset reason not given\]$" "$work/once.read" \
+    || { echo "FAIL once: no boot line"; failed=1; }
 
 # lost
 start_board lost --name fake-board --ring 512 --rate 200 --line 80
@@ -110,10 +116,11 @@ cat "$work/lost.err"
 verdict $check lost "$work/lost.board" "$work/lost.read" - 5
 
 # restart
-start_board restart --name fake-board --rate 10 --restart-after 4
+start_board restart --name fake-board --rate 10 --restart-after 4 --reset-reason 1 --resets 0
 follow_for restart 6 fake-board --follow
 stop_boards
 verdict $check restart "$work/restart.board" "$work/restart.read" - 20
+grep -q "reset SW (3), 0 unexpected resets" "$work/restart.read" || { echo "FAIL restart: the new boot's reset"; failed=1; }
 
 # dropped
 start_board dropped --name fake-board --rate 20 --drop-every 5

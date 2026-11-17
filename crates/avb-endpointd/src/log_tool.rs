@@ -11,6 +11,12 @@
 //! of the devices it looks for: the one named by ID, or, for a name,
 //! those that advertise Address Access.
 //!
+//! Before a boot's lines, and after each restart, it says in a line of
+//! its own the boot's ID, how long it has run, and, where the device
+//! says, why it began and how many boots began unexpectedly:
+//! `[esp-mic: boot 812c21f8, up 181 s, reset PANIC (4), 3 unexpected
+//! resets]`.
+//!
 //! With `--stats`, it says on stderr every 10 s, and at the end, what
 //! reading cost: its Address Access frames and octets each way, round
 //! trips, retries, timeouts and refusals, and each line's latency from
@@ -32,7 +38,7 @@ use atdecc::adp::EntityCapabilities;
 use atdecc::aecp::{AaStatus, AddressAccessPdu, AecpHeader, AecpMessageType};
 use atdecc::controller::{CommandId, Controller, Event, Outcome};
 use atdecc::descriptor::MemoryObjectType;
-use atdecc::log::{LogPiece, LogTail};
+use atdecc::log::{LogHeader, LogPiece, LogTail, reset_reason_name};
 use atdecc::{EntityId, Instant, MacAddress};
 use avb_endpointd::status::EXIT_USAGE;
 
@@ -128,6 +134,9 @@ struct Board {
     /// The device's milliseconds since boot when its log was first read
     /// this boot: lines logged before then were waiting, not late.
     reading_since_ms: Option<u32>,
+    /// The header of the boot read last, as the first read of it found
+    /// it.
+    boot: Option<LogHeader>,
     stats: Stats,
 }
 
@@ -187,6 +196,7 @@ fn follow(options: &Options, interface: &str) -> Result<(), String> {
             line: Vec::new(),
             skip_partial: false,
             reading_since_ms: None,
+            boot: None,
             stats: Stats::default(),
         })
         .collect();
@@ -554,11 +564,33 @@ fn print_piece(board: &mut Board, piece: LogPiece, prefix: bool, out: &mut impl 
             board.reading_since_ms = None;
             let _ = writeln!(out, "[{label} restarted]");
         }
+        LogPiece::Boot(header) => {
+            board.boot = Some(header);
+            let _ = writeln!(out, "[{label}: {}]", boot_text(&header));
+        }
         LogPiece::Dropped(lines) => {
             board.stats.dropped_lines += u64::from(lines);
             let _ = writeln!(out, "[{label} dropped {lines} lines]");
         }
     }
+}
+
+/// A boot as its header tells it: its ID, how long it has run, why it
+/// began and how many boots began unexpectedly.
+fn boot_text(header: &LogHeader) -> String {
+    let mut text = format!("boot {:08x}, up {} s", header.boot, header.ms / 1000);
+    match header.reset_reason {
+        Some(reason) => {
+            let name = reset_reason_name(reason).unwrap_or("reason");
+            text.push_str(&format!(", reset {name} ({reason})"));
+        }
+        None => text.push_str(", reset reason not given"),
+    }
+    if let Some(resets) = header.resets {
+        let plural = if resets == 1 { "" } else { "s" };
+        text.push_str(&format!(", {resets} unexpected reset{plural}"));
+    }
+    text
 }
 
 /// Prints a line left without its newline at the end.
@@ -662,7 +694,8 @@ fn write_json(path: &Path, boards: &[Board], elapsed: Duration) {
                  \"retries\":{},\"timeouts\":{},\"refused\":{},\"rtt_ms_avg\":{rtt_avg:.3},\
                  \"rtt_ms_max\":{rtt_max:.3},\"lines\":{},\"log_octets\":{},\"lost_octets\":{},\
                  \"dropped_lines\":{},\"restarts\":{},\"latency_ms_median\":{},\
-                 \"latency_ms_p95\":{},\"latency_ms_max\":{}}}",
+                 \"latency_ms_p95\":{},\"latency_ms_max\":{},\"boot\":{},\
+                 \"reset_reason\":{},\"resets\":{}}}",
                 board
                     .entity_id
                     .map_or_else(String::new, |id| format!("0x{:016x}", id.0)),
@@ -683,6 +716,11 @@ fn write_json(path: &Path, boards: &[Board], elapsed: Duration) {
                 number(percentile(&latencies, 0.5)),
                 number(percentile(&latencies, 0.95)),
                 number(latencies.last().copied()),
+                board
+                    .boot
+                    .map_or("null".into(), |boot| format!("\"{:08x}\"", boot.boot)),
+                number(board.boot.and_then(|boot| boot.reset_reason).map(u32::from)),
+                number(board.boot.and_then(|boot| boot.resets).map(u32::from)),
             )
         })
         .collect();
@@ -735,6 +773,32 @@ mod tests {
     }
 
     #[test]
+    fn a_boot_line_says_why_it_began_when_the_board_says() {
+        let mut header = LogHeader {
+            boot: 0x812c_21f8,
+            ms: 181_400,
+            ring: 1,
+            ..LogHeader::default()
+        };
+        assert_eq!(
+            boot_text(&header),
+            "boot 812c21f8, up 181 s, reset reason not given"
+        );
+        header.reset_reason = Some(4);
+        header.resets = Some(3);
+        assert_eq!(
+            boot_text(&header),
+            "boot 812c21f8, up 181 s, reset PANIC (4), 3 unexpected resets"
+        );
+        header.reset_reason = Some(40);
+        header.resets = Some(1);
+        assert_eq!(
+            boot_text(&header),
+            "boot 812c21f8, up 181 s, reset reason (40), 1 unexpected reset"
+        );
+    }
+
+    #[test]
     fn a_lines_milliseconds_are_its_first_parenthesized_number() {
         assert_eq!(line_ms(b"I (12345) avb: hello (7)\n"), Some(12345));
         assert_eq!(line_ms(b"no time here\n"), None);
@@ -755,6 +819,7 @@ mod tests {
             line: Vec::new(),
             skip_partial: false,
             reading_since_ms: Some(90),
+            boot: None,
             stats: Stats::default(),
         };
         let mut out = Vec::new();
