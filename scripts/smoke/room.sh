@@ -16,7 +16,8 @@
 # and the namespace's runtime folder hides the computer's own, so nothing
 # here reaches the computer's sound. Build first, with `cargo build -p
 # avb-endpointd --features daemon --bin avb-endpointd --examples`; set
-# TARGET to another build folder than target/debug.
+# TARGET to another build folder than target/debug. NO_WAV=1 records no
+# WAV, only the times of late and broken blocks in <record.wav>.times.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -93,7 +94,7 @@ gptpd=$!
 first=$!
 "$bin" --interface v1 >"$work/v1.log" 2>&1 &
 second=$!
-"$target/examples/ring_room" "$work/run/avb-endpointd" "$play" "$record" "$work/stop" &
+"$target/examples/ring_room" ${NO_WAV:+--no-wav} "$work/run/avb-endpointd" "$play" "$record" "$work/stop" &
 the_room=$!
 
 "$@"

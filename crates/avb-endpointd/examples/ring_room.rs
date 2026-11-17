@@ -3,7 +3,7 @@
 //! which streams to the app's entity, and records what its input's ring
 //! takes from the app's entity into another, until a stop file appears.
 //!
-//!   ring_room <sockets' folder> <play.wav> <record.wav> <stop file>
+//!   ring_room [--no-wav] <sockets' folder> <play.wav> <record.wav> <stop file>
 //!
 //! The WAV played may be 16, 24 or 32-bit integer PCM, of any channels:
 //! its first channels go to the ring's first, silence past them. It
@@ -11,7 +11,10 @@
 //! recorded is 32-bit integer PCM of the ring's channels, every word as
 //! it came; beside it, `<record.wav>.times` lists the first block's
 //! presentation time and each block that came late, after a gap, or with
-//! a restart.
+//! a restart. The recording is synced to disk every 4 MiB as it grows, so
+//! no burst of writeback follows a long run onto the computer's other
+//! work, such as a bench talker. `--no-wav` records no WAV, only the
+//! times beside where it would be.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -90,12 +93,17 @@ fn read_wav(path: &Path) -> io::Result<Wav> {
     })
 }
 
+/// Octets written between syncs: about ten seconds of a 48 kHz
+/// recording of a few channels.
+const SYNC_EVERY: u64 = 4 << 20;
+
 /// A 32-bit integer PCM WAV file being written, its lengths set as it
-/// closes.
+/// closes, synced to disk every [`SYNC_EVERY`] octets.
 struct WavWriter {
     file: BufWriter<File>,
     frames: u32,
     channels: u16,
+    unsynced: u64,
 }
 
 impl WavWriter {
@@ -115,6 +123,7 @@ impl WavWriter {
             file,
             frames: 0,
             channels,
+            unsynced: 0,
         })
     }
 
@@ -123,6 +132,12 @@ impl WavWriter {
             self.file.write_all(&word.to_le_bytes())?;
         }
         self.frames += (words.len() / usize::from(self.channels)) as u32;
+        self.unsynced += words.len() as u64 * 4;
+        if self.unsynced >= SYNC_EVERY {
+            self.file.flush()?;
+            self.file.get_ref().sync_data()?;
+            self.unsynced = 0;
+        }
         Ok(())
     }
 
@@ -133,7 +148,7 @@ impl WavWriter {
         file.write_all(&(36 + data).to_le_bytes())?;
         file.seek(SeekFrom::Start(40))?;
         file.write_all(&data.to_le_bytes())?;
-        Ok(())
+        file.sync_data()
     }
 }
 
@@ -152,9 +167,17 @@ fn attached<T>(attach: impl Fn() -> Result<T, Error>) -> io::Result<T> {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let wav_too = match args.iter().position(|arg| arg == "--no-wav") {
+        Some(at) => {
+            args.remove(at);
+            false
+        }
+        None => true,
+    };
+    let args: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
     let [folder, play, record, stop] = args.as_slice() else {
-        eprintln!("ring_room <sockets' folder> <play.wav> <record.wav> <stop file>");
+        eprintln!("ring_room [--no-wav] <sockets' folder> <play.wav> <record.wav> <stop file>");
         std::process::exit(2);
     };
     let wav = read_wav(play)?;
@@ -173,7 +196,15 @@ fn main() -> io::Result<()> {
         );
     }
 
-    let mut recording = WavWriter::create(record, input.channels() as u16, wav.rate)?;
+    let mut recording = if wav_too {
+        Some(WavWriter::create(
+            record,
+            input.channels() as u16,
+            wav.rate,
+        )?)
+    } else {
+        None
+    };
     let mut times = BufWriter::new(File::create(format!("{}.times", record.display()))?);
     writeln!(times, "# frame presented_ns flags missed")?;
     let mut samples = Vec::new();
@@ -218,7 +249,9 @@ fn main() -> io::Result<()> {
                         )?;
                         first = false;
                     }
-                    recording.write(&samples)?;
+                    if let Some(recording) = &mut recording {
+                        recording.write(&samples)?;
+                    }
                 }
                 Ok(None) => break,
                 Err(Error::Overrun { lost_frames }) => {
@@ -228,11 +261,15 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    recording.close()?;
+    if let Some(recording) = recording {
+        recording.close()?;
+        println!(
+            "ring_room: played {played} frames, recorded to {}",
+            record.display()
+        );
+    } else {
+        println!("ring_room: played {played} frames, recorded no WAV");
+    }
     times.flush()?;
-    println!(
-        "ring_room: played {played} frames, recorded to {}",
-        record.display()
-    );
     Ok(())
 }
