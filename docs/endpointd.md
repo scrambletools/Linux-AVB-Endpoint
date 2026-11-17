@@ -872,6 +872,13 @@ count, such as a 6-channel amp input, connects as it is set (the user,
   `--interface`, taking a device's name or entity ID. It starts or
   stops the unit and edits the file under the lock. No app is needed.
   Apps do the same through the library, `config::edit` and `unit`.
+- **Other devices' upkeep from the tool:** `avb-endpointd log`, `crash`
+  and `firmware` read a device's log and crash dump and upload its
+  firmware over the network, as IEEE 1722.1-2021 memory objects
+  (LOG_OBJECT, CRASH_DUMP, FIRMWARE_IMAGE) through Address Access and,
+  for firmware, Annex D's upload, so an ESP32 board needs no USB cable.
+  They run as a controller of their own and ask a device nothing unless
+  run. Released in avb-endpointd 0.3.3.
 - **plaa's** Network Audio becomes a front end: this computer on or off
   the network, the devices found with hide and pin toggles, new devices
   in pinned mode, the devices' and gptpd's states from the status, and

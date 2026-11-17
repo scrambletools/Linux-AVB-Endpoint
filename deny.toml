@@ -41,5 +41,3 @@ unmaintained = "workspace"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The avb crates from their repository, until atdecc 0.2.3 is released.
-allow-git = ["https://github.com/scrambletools/avb"]

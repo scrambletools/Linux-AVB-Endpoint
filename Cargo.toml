@@ -26,12 +26,3 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-
-# atdecc 0.2.3, with the log reader, is on scrambletools/avb main but not
-# yet on crates.io: until it is released, the avb crates come from that
-# commit, all four, so there is one of each. The release takes this out.
-[patch.crates-io]
-atdecc = { git = "https://github.com/scrambletools/avb", rev = "b06397c1f06c3b0e12f0f10756141dca80b37e5d" }
-avb-mrp = { git = "https://github.com/scrambletools/avb", rev = "b06397c1f06c3b0e12f0f10756141dca80b37e5d" }
-avb-net = { git = "https://github.com/scrambletools/avb", rev = "b06397c1f06c3b0e12f0f10756141dca80b37e5d" }
-avb-stream = { git = "https://github.com/scrambletools/avb", rev = "b06397c1f06c3b0e12f0f10756141dca80b37e5d" }
