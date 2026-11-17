@@ -30,15 +30,14 @@ use std::time::Duration;
 
 use atdecc::adp::EntityCapabilities;
 use atdecc::aecp::{AaStatus, AddressAccessPdu, AecpHeader, AecpMessageType};
-use atdecc::controller::{CommandId, Config, Controller, Event, Outcome};
+use atdecc::controller::{CommandId, Controller, Event, Outcome};
 use atdecc::descriptor::MemoryObjectType;
 use atdecc::log::{LogPiece, LogTail};
-use atdecc::{ADP_ACMP_MULTICAST, EntityId, Instant, MacAddress};
+use atdecc::{EntityId, Instant, MacAddress};
 use avb_endpointd::status::EXIT_USAGE;
-use avb_net::Socket;
 
-/// The instance octet of this command's controller.
-const CONTROLLER_INSTANCE: u8 = 0xfa;
+use crate::tool_net::{self, Wanted};
+
 /// How long to look for the devices asked for.
 const FIND_FOR: Duration = Duration::from_secs(10);
 const STATS_EVERY: Duration = Duration::from_secs(10);
@@ -84,23 +83,6 @@ fn parse(words: &[String]) -> Result<Options, String> {
         return Err("log needs a device: its entity ID or its name".into());
     }
     Ok(options)
-}
-
-/// A device asked for: its entity ID, or its entity name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Wanted {
-    Id(EntityId),
-    Name(String),
-}
-
-impl Wanted {
-    fn of(text: &str) -> Self {
-        let digits = text.strip_prefix("0x").unwrap_or(text);
-        match u64::from_str_radix(digits, 16) {
-            Ok(id) if digits.len() == 16 => Wanted::Id(EntityId(id)),
-            _ => Wanted::Name(text.to_owned()),
-        }
-    }
 }
 
 /// What reading a device's log cost, and how late its lines came.
@@ -168,18 +150,7 @@ pub fn run(words: &[String], interface: &str) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    // Raw sockets come from avb-netraw, as the daemon's do.
-    #[cfg(target_os = "linux")]
-    let _ = avb_net::broker::use_helper("avb-netraw", &[Path::new("/usr/lib/avb-endpointd")]);
-    let Some(mac) = avb_net::interfaces()
-        .into_iter()
-        .find(|found| found.name == interface)
-        .map(|found| found.mac)
-    else {
-        eprintln!("no interface named {interface}");
-        return ExitCode::FAILURE;
-    };
-    match follow(&options, interface, mac) {
+    match follow(&options, interface) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("log: {error}");
@@ -188,13 +159,8 @@ pub fn run(words: &[String], interface: &str) -> ExitCode {
     }
 }
 
-fn follow(options: &Options, interface: &str, mac: MacAddress) -> Result<(), String> {
-    let socket =
-        Socket::open(interface, atdecc::ETHERTYPE_AVTP).map_err(|error| error.to_string())?;
-    socket
-        .join_multicast(ADP_ACMP_MULTICAST)
-        .map_err(|error| error.to_string())?;
-    let _ = socket.keep_payloads_starting(atdecc::avtp::subtype::ADP..=atdecc::avtp::subtype::MAAP);
+fn follow(options: &Options, interface: &str) -> Result<(), String> {
+    let (socket, mac) = tool_net::open(interface)?;
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
@@ -203,28 +169,8 @@ fn follow(options: &Options, interface: &str, mac: MacAddress) -> Result<(), Str
 
     let started = std::time::Instant::now();
     let clock = || Instant::from_nanos(started.elapsed().as_nanos() as u64);
-    let controller_id = avb_endpointd::entity_id(mac, CONTROLLER_INSTANCE);
-    let mut config = Config::new(controller_id);
-    config.enumerate = false;
-    config.register_unsolicited = false;
-    config.network_info = false;
-    config.read_mappings = false;
-    config.media_clock_info = false;
-    config.read_counters = false;
-    config.read_transit_times = false;
-    config.read_configurations = false;
-    config.read_talker_state = false;
-    config.lite_status = false;
-    config.wireless_status = false;
-    config.read_logos = false;
-    config.advertise = None;
-    // Apart from an earlier run's, whose answers may still come.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |since| since.as_nanos() as u64);
-    config.first_sequence_id = seed as u16;
-    config.random_seed = seed;
-    let mut controller = Controller::new(config);
+    let mut controller = tool_net::controller(mac);
+    let controller_id = controller.entity_id();
 
     let mut boards: Vec<Board> = options
         .entities
@@ -765,20 +711,6 @@ fn json_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn devices_are_named_by_id_or_name() {
-        assert_eq!(
-            Wanted::of("0x8c1f6436c1200000"),
-            Wanted::Id(EntityId(0x8c1f_6436_c120_0000))
-        );
-        assert_eq!(
-            Wanted::of("8c1f6436c1200000"),
-            Wanted::Id(EntityId(0x8c1f_6436_c120_0000))
-        );
-        assert_eq!(Wanted::of("esp-mic"), Wanted::Name("esp-mic".into()));
-        assert_eq!(Wanted::of("cafe"), Wanted::Name("cafe".into()));
-    }
 
     #[test]
     fn options_parse() {

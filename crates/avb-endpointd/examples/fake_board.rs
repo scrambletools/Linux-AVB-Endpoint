@@ -7,12 +7,19 @@
 //!   fake_board --interface NAME [--name NAME] [--instance N] [--ring OCTETS]
 //!              [--rate LINES_PER_SECOND] [--line OCTETS] [--burst OCTETS]
 //!              [--restart-after SECONDS] [--drop-every N] [--for SECONDS]
+//!              [--crash-dump OCTETS] [--crash-max OCTETS] [--crash-file PATH]
 //!
 //! `--burst` writes that many octets of lines at once at the start, as a
 //! boot does. `--restart-after` starts the log over in a new boot that
 //! long after the start, once. `--drop-every` counts every Nth line as
 //! dropped instead of writing it. It writes each line on stdout too, to
 //! compare with what was read.
+//!
+//! `--crash-dump` keeps a crash dump of that many octets, as a board's
+//! CRASH_DUMP memory object, which START_OPERATION erases; `--crash-max`
+//! alone keeps an empty one, up to that size (256 KiB by default).
+//! `--crash-file` writes the dump's octets there, to compare with what
+//! was read.
 
 use std::io::Write;
 use std::path::Path;
@@ -33,12 +40,16 @@ struct Options {
     restart_after: Option<Duration>,
     drop_every: Option<u64>,
     run_for: Option<Duration>,
+    crash_dump: Option<usize>,
+    crash_max: Option<u64>,
+    crash_file: Option<String>,
 }
 
 const USAGE: &str = "usage: fake_board --interface NAME [--name NAME] [--instance N] \
                      [--ring OCTETS] [--rate LINES_PER_SECOND] [--line OCTETS] \
                      [--burst OCTETS] [--restart-after SECONDS] [--drop-every N] \
-                     [--for SECONDS]";
+                     [--for SECONDS] [--crash-dump OCTETS] [--crash-max OCTETS] \
+                     [--crash-file PATH]";
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
@@ -52,6 +63,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
         restart_after: None,
         drop_every: None,
         run_for: None,
+        crash_dump: None,
+        crash_max: None,
+        crash_file: None,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -73,6 +87,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--drop-every" => options.drop_every = Some(number(value()?)? as u64),
             "--for" => options.run_for = Some(Duration::from_secs_f64(number(value()?)?)),
+            "--crash-dump" => options.crash_dump = Some(number(value()?)? as usize),
+            "--crash-max" => options.crash_max = Some(number(value()?)? as u64),
+            "--crash-file" => options.crash_file = Some(value()?.clone()),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -153,6 +170,13 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
     // Lines count milliseconds from their boot, as a board's do.
     let mut booted = clock();
     entity.keep_log(booted, options.ring, boot);
+    if options.crash_dump.is_some() || options.crash_max.is_some() {
+        let dump = crash_dump(options.crash_dump.unwrap_or(0));
+        if let Some(path) = &options.crash_file {
+            std::fs::write(path, &dump)?;
+        }
+        entity.keep_crash_dump(options.crash_max.unwrap_or(256 * 1024), dump);
+    }
     entity.start(clock());
     let mut stdout = std::io::stdout().lock();
     let mut number = 0;
@@ -224,4 +248,13 @@ fn run(options: &Options, mac: atdecc::MacAddress) -> std::io::Result<()> {
             entity.handle_frame(clock(), received.source, &buffer[..received.length]);
         }
     }
+}
+
+/// A stand-in for a core dump of `length` octets: a name, then a pattern
+/// that shows any octet out of place.
+fn crash_dump(length: usize) -> Vec<u8> {
+    let mut dump = b"FAKE CORE DUMP\n".to_vec();
+    dump.extend((0..length).map(|at| (at.wrapping_mul(31) ^ (at >> 8)) as u8));
+    dump.truncate(length);
+    dump
 }

@@ -37,6 +37,7 @@ avb-endpointd on --interface enp2s0      # start it now and at each login
 avb-endpointd list --interface enp2s0    # speakers and microphones found
 avb-endpointd off --interface enp2s0
 avb-endpointd log esp-mic --follow --interface enp2s0   # a device's log
+avb-endpointd crash esp-mic --interface enp2s0          # its crash dump
 ```
 
 Each speaker or amp input found on the network gets a playback device
@@ -56,6 +57,10 @@ ESP32 board's console without its cable: a LOG_OBJECT memory object,
 read through Address Access, named by the device's entity name or ID.
 `--follow` keeps reading and `--stats` says what the reading costs. A
 device is asked nothing unless it runs.
+`crash` saves the crash dump a device keeps the same way, a CRASH_DUMP
+memory object, to a file (`-o`), and `--erase` erases it after. An ESP32
+board's is ESP-IDF's core dump, which `esp-coredump` reads with the
+crashed firmware's ELF.
 
 ## The files
 

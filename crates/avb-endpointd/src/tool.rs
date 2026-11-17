@@ -12,8 +12,8 @@ use avb_endpointd::devices::{DeviceState, RemoteStream, Way};
 use avb_endpointd::status::{self, DeviceStatus, EXIT_USAGE};
 use avb_endpointd::unit;
 
-pub const COMMANDS: [&str; 9] = [
-    "on", "off", "list", "pin", "unpin", "hide", "show", "mode", "log",
+pub const COMMANDS: [&str; 10] = [
+    "on", "off", "list", "pin", "unpin", "hide", "show", "mode", "log", "crash",
 ];
 
 pub const USAGE: &str = "\
@@ -23,9 +23,10 @@ usage: avb-endpointd --interface NAME [--config FILE]
        avb-endpointd mode destinations|sources all|pinned --interface NAME
        avb-endpointd log ENTITY... --interface NAME [--follow] [--stats]
                  [--stats-json FILE] [--poll MS]
+       avb-endpointd crash ENTITY --interface NAME [-o FILE] [--erase]
 STREAM is a device's name as list shows it, or <entity id>:in<n> for a
 listener input, <entity id>:out<n> for a talker output. ENTITY is a
-device's entity ID or entity name, for the log it keeps.";
+device's entity ID or entity name, for the log or crash dump it keeps.";
 
 /// Runs `command` with its `words` on `interface`'s file, or `path`.
 pub fn run(command: &str, words: &[String], interface: &str, path: Option<PathBuf>) -> ExitCode {
