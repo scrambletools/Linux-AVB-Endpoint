@@ -31,7 +31,7 @@ all = { level = "warn", priority = -1 }
 # yet on crates.io: until it is released, the avb crates come from that
 # commit, all four, so there is one of each. The release takes this out.
 [patch.crates-io]
-atdecc = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
-avb-mrp = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
-avb-net = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
-avb-stream = { git = "https://github.com/scrambletools/avb", rev = "bad9ce709a98201af6bdcffc2ab2dcd8864b47c5" }
+atdecc = { git = "https://github.com/scrambletools/avb", rev = "cc23ffadad903912aebf9d8a95d7213bac6384b1" }
+avb-mrp = { git = "https://github.com/scrambletools/avb", rev = "cc23ffadad903912aebf9d8a95d7213bac6384b1" }
+avb-net = { git = "https://github.com/scrambletools/avb", rev = "cc23ffadad903912aebf9d8a95d7213bac6384b1" }
+avb-stream = { git = "https://github.com/scrambletools/avb", rev = "cc23ffadad903912aebf9d8a95d7213bac6384b1" }

@@ -2,7 +2,7 @@
 //! LOG_OBJECT memory object (IEEE 1722.1-2021, 7.2.10), read through
 //! Address Access, so a device's log needs no console cable. A device is
 //! asked nothing unless this runs. It has one read out per device at a
-//! time: every 250 ms while the log grows, the header alone once a second
+//! time: every 250 ms while the log grows, the header alone every 250 ms
 //! after it stops, and back to back while it is behind (see
 //! [`atdecc::log`]).
 //!
