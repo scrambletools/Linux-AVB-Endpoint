@@ -56,15 +56,9 @@ impl Wanted {
 /// The controller these commands run: it reads only the models it is
 /// told to, registers for nothing and advertises nothing.
 pub fn controller(mac: MacAddress) -> Controller {
-    controller_registering(mac, false)
-}
-
-/// The same controller, registering for the unsolicited notifications of
-/// the entities it reads where `register`, as OPERATION_STATUS needs.
-fn controller_registering(mac: MacAddress, register: bool) -> Controller {
     let mut config = Config::new(avb_endpointd::entity_id(mac, CONTROLLER_INSTANCE));
     config.enumerate = false;
-    config.register_unsolicited = register;
+    config.register_unsolicited = false;
     config.network_info = false;
     config.read_mappings = false;
     config.media_clock_info = false;
@@ -117,28 +111,14 @@ pub struct Link {
 
 impl Link {
     pub fn open(interface: &str) -> Result<Self, String> {
-        Self::open_registering(interface, false)
-    }
-
-    /// A link whose controller registers for the unsolicited
-    /// notifications of the entities it reads, to hear their
-    /// OPERATION_STATUS.
-    pub fn open_registering(interface: &str, register: bool) -> Result<Self, String> {
         let (socket, mac) = open(interface)?;
         Ok(Link {
             socket,
-            controller: controller_registering(mac, register),
+            controller: controller(mac),
             started: std::time::Instant::now(),
             buffer: vec![0; 1600],
             events: VecDeque::new(),
         })
-    }
-
-    /// Runs the controller until it has events, or until `until`, and
-    /// gives them.
-    pub fn events(&mut self, until: Instant) -> Result<Vec<Event>, String> {
-        self.step(until)?;
-        Ok(self.events.drain(..).collect())
     }
 
     pub fn now(&self) -> Instant {
