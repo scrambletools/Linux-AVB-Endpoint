@@ -47,6 +47,16 @@ pub struct Config {
     /// whose VLANs cannot be set up (AVB Lite profile, 7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_vlan: Option<u16>,
+    /// Whether a talker whose reservation changes with its format, in
+    /// frame size, frames each interval or class, goes on at once under
+    /// another of its stream IDs, which no bridge holds anything of. It is
+    /// for bridges that keep the first reservation they registered for a
+    /// stream ID while it stays declared and queue the stream by it, as
+    /// the MOTU switch does. Off by default: a talker then moves only when
+    /// its stream grows, and otherwise declares again on the same ID 2 s
+    /// after withdrawing it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub new_stream_id_on_change: bool,
     /// Which listener inputs on other devices get a sink here: every
     /// compatible one but those hidden, the default, or only those pinned.
     #[serde(skip_serializing_if = "Shown::is_all")]
@@ -83,6 +93,7 @@ impl Default for Config {
             multicast_escalation: false,
             unicast_fanout: None,
             media_vlan: None,
+            new_stream_id_on_change: false,
             destinations: Shown::All,
             sources: Shown::Pinned,
             destination_talkers: None,

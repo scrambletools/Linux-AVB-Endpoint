@@ -128,21 +128,23 @@ const RUN_SAID: Duration = Duration::from_secs(10);
 /// How long an analyzed input's run goes on once its listener stopped,
 /// for its last frames to be analyzed.
 const RUN_TAIL: Duration = Duration::from_millis(50);
-/// How long a talker whose stream changed waits with its declaration
-/// withdrawn before declaring the new one: long enough for the bridge to
-/// let the old go, as a bridge can keep the old frame size when a
-/// declaration changes in place, and drop what no longer fits.
+/// How long a talker whose format changed waits with its declaration
+/// withdrawn before declaring again on the same stream ID.
 const REDECLARE: Duration = Duration::from_secs(2);
-/// A talker whose stream grew waits longer: a bridge keeps the old
-/// value, its frame size, while any registration of the stream lasts,
-/// such as the listeners' it let go only moments ago, and polices the new
-/// stream to it. It declares the new once the bridge has sent two
+/// A talker whose stream grew, or with `new_stream_id_on_change` whose
+/// reservation changed at all, and that can't take another stream ID,
+/// waits longer: a bridge keeps the old value while any registration of
+/// the stream lasts, such as the listeners' it let go only moments ago,
+/// and polices or queues the new stream by it. The MOTU switch kept a
+/// stream that went from class A to B in class A for over an hour, under
+/// a declaration made again 2 s after the Leave. A program's talker that
+/// grew waits the same. It declares the new once the bridge has sent two
 /// LeaveAlls since, and the longest LeaveTime a bridge takes more, or
 /// after the longest this takes where the bridge sends none.
 const GROWN_LEAVE_ALLS: u32 = 2;
-/// The stream IDs each output takes turns with as it grows, a bridge
-/// holding nothing of a stream new to it; one given up within
-/// [`GROWN_MOST`] is taken again only after the wait.
+/// The stream IDs each output takes turns with as it grows, or as its
+/// reservation changes, a bridge holding nothing of a stream new to it;
+/// one given up within [`GROWN_MOST`] is taken again only after the wait.
 const GENERATIONS: u8 = 4;
 const GROWN_AFTER: Duration = Duration::from_secs(1);
 const GROWN_MOST: Duration = Duration::from_secs(32);
@@ -273,10 +275,66 @@ fn output_stream(mac: MacAddress, instance: u8, index: u16) -> StreamId {
     StreamId::new(mac, (u16::from(instance) << 8) | index)
 }
 
-/// A stream an output that grew goes on as: its ID in another of four
-/// generations, in the two bits its index, under 64, leaves.
+/// A stream an output that grew, or whose reservation changed, goes on
+/// as: its ID in another of four generations, in the two bits its index,
+/// under 64, leaves.
 fn stream_generation(stream: StreamId, generation: u8) -> StreamId {
     StreamId((stream.0 & !0xc0) | (u64::from(generation % GENERATIONS) << 6))
+}
+
+/// What a bridge reserves for a stream from its Talker Advertise: its
+/// frame size, its frames each interval and its class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reservation {
+    max_frame_size: u16,
+    max_interval_frames: u16,
+    priority: u8,
+}
+
+impl Reservation {
+    fn of(declaration: &TalkerDeclaration) -> Self {
+        Reservation {
+            max_frame_size: declaration.max_frame_size,
+            max_interval_frames: declaration.max_interval_frames,
+            priority: declaration.priority,
+        }
+    }
+
+    /// The bandwidth it asks for, in octets a second: its frames on the
+    /// wire each interval of its class.
+    fn bandwidth(self) -> u64 {
+        let intervals = if self.priority == CLASS_B_PRIORITY {
+            4000
+        } else {
+            8000
+        };
+        (u64::from(self.max_frame_size) + FRAME_OVERHEAD)
+            * u64::from(self.max_interval_frames)
+            * intervals
+    }
+
+    /// Whether a talker that declared this and now declares `declaration`
+    /// goes on under another stream ID: where its stream grew, which a
+    /// bridge polices to the old frame size; or, `any_change`, where it
+    /// asks a bridge for anything else, smaller or in another class too,
+    /// which a bridge may keep for the stream ID as it was.
+    fn moves_for(self, declaration: &TalkerDeclaration, any_change: bool) -> bool {
+        let now = Reservation::of(declaration);
+        if any_change {
+            now != self
+        } else {
+            now.bandwidth() > self.bandwidth()
+        }
+    }
+
+    /// What the log says moved a talker on.
+    fn why(any_change: bool) -> &'static str {
+        if any_change {
+            "the stream's reservation changed"
+        } else {
+            "the stream grew"
+        }
+    }
 }
 
 /// A talker output: its endpoint, and its index there.
@@ -309,11 +367,11 @@ struct OutputState {
     redeclare_at: Option<Duration>,
     /// When it last withdrew its declaration.
     withdrawn_at: Option<Duration>,
-    /// The bandwidth it last declared, as a bridge may still keep it; and
-    /// while a stream grown past it waits, the bridge's Talker LeaveAlls
-    /// heard by when it withdrew.
-    declared_bandwidth: Option<u64>,
-    grown_from: Option<u32>,
+    /// The reservation it last declared, as a bridge may still keep it;
+    /// and while a stream whose reservation changed waits, the bridge's
+    /// Talker LeaveAlls heard by when it withdrew.
+    declared: Option<Reservation>,
+    changed_from: Option<u32>,
     /// Which of its stream IDs it sends, and when it last gave up each.
     generation: u8,
     given_up: [Option<Duration>; GENERATIONS as usize],
@@ -1206,14 +1264,7 @@ fn log(message: impl AsRef<str>) {
 /// The bandwidth a Talker Advertise asks for, in octets a second: its
 /// frames on the wire each interval of its class.
 fn bandwidth(declaration: &TalkerDeclaration) -> u64 {
-    let intervals = if declaration.priority == CLASS_B_PRIORITY {
-        4000
-    } else {
-        8000
-    };
-    (u64::from(declaration.max_frame_size) + FRAME_OVERHEAD)
-        * u64::from(declaration.max_interval_frames)
-        * intervals
+    Reservation::of(declaration).bandwidth()
 }
 
 /// What a talker sent, for the log.
@@ -3467,7 +3518,7 @@ impl Runtime {
             if addressed && self.output(out).redeclare_at.is_some_and(|at| at <= since) {
                 let output = self.output_mut(out);
                 output.redeclare_at = None;
-                output.grown_from = None;
+                output.changed_from = None;
                 self.declare_talker(out);
                 self.update_talker(out);
             }
@@ -3667,7 +3718,7 @@ impl Runtime {
             return;
         }
         let since = self.elapsed();
-        self.output_mut(out).declared_bandwidth = Some(bandwidth(&declaration));
+        self.output_mut(out).declared = Some(Reservation::of(&declaration));
         self.port.msrp.declare(
             since,
             msrp::attribute::TALKER_ADVERTISE,
@@ -3736,37 +3787,41 @@ impl Runtime {
     }
 
     /// When a talker whose format changed declares again: soon, unless its
-    /// stream grew past what it declared before, through a bridge.
+    /// stream grew past what it declared before, through a bridge; or,
+    /// with `new_stream_id_on_change`, unless its reservation changed at
+    /// all.
     fn redeclare_changed(&mut self, out: Out) {
         let since = self.elapsed();
-        let grown = self.lite.is_none()
+        let any_change = self.config.new_stream_id_on_change;
+        let changed = self.lite.is_none()
             && self.declaration(out).is_some_and(|declaration| {
                 self.output(out)
-                    .declared_bandwidth
-                    .is_some_and(|before| bandwidth(&declaration) > before)
+                    .declared
+                    .is_some_and(|before| before.moves_for(&declaration, any_change))
             });
         let leave_alls = self.talker_leave_alls;
         let name = self.out_name(out);
-        if grown && self.next_generation(out, since) {
+        if changed && self.next_generation(out, since) {
             return;
         }
         let output = self.output_mut(out);
-        if !grown {
+        if !changed {
             output.redeclare_at = Some(since + REDECLARE);
-            output.grown_from = None;
-        } else if output.grown_from.is_none() {
-            output.grown_from = Some(leave_alls);
+            output.changed_from = None;
+        } else if output.changed_from.is_none() {
+            output.changed_from = Some(leave_alls);
             output.redeclare_at = Some(since + GROWN_MOST);
             log(format!(
-                "{name}: the stream grew, so it waits for the bridge to let the old reservation go"
+                "{name}: {}, so it waits for the bridge to let the old reservation go",
+                Reservation::why(any_change)
             ));
         }
     }
 
-    /// Moves a grown output to its next stream ID, which a bridge holds
-    /// nothing of, to declare it at once; not where that ID was given up
-    /// too lately, which waits for the bridge instead. Our inputs of it find
-    /// where it went.
+    /// Moves an output whose reservation changed to its next stream ID,
+    /// which a bridge holds nothing of, to declare it at once; not where
+    /// that ID was given up too lately, which waits for the bridge instead.
+    /// Our inputs of it find where it went.
     fn next_generation(&mut self, out: Out, since: Duration) -> bool {
         let Some((stream_id, _)) = self.endpoints[out.0].entity.output_stream(out.1) else {
             return false;
@@ -3780,14 +3835,15 @@ impl Runtime {
         output.generation = next;
         // A stream new to the bridge has no old value to wait out.
         output.redeclare_at = Some(since);
-        output.grown_from = None;
+        output.changed_from = None;
         let moved = stream_generation(stream_id, next);
         self.endpoints[out.0]
             .entity
             .set_output_stream_id(out.1, moved);
         log(format!(
-            "{}: the stream grew, so it goes on as stream {moved}",
-            self.out_name(out)
+            "{}: {}, so it goes on as stream {moved}",
+            self.out_name(out),
+            Reservation::why(self.config.new_stream_id_on_change)
         ));
         let now = self.now();
         for input in self.ins() {
@@ -3796,8 +3852,9 @@ impl Runtime {
         true
     }
 
-    /// The bridge sent a LeaveAll for Talker Advertises: a grown stream
-    /// that heard enough since it withdrew declares a LeaveTime later.
+    /// The bridge sent a LeaveAll for Talker Advertises: a stream whose
+    /// reservation changed that heard enough since it withdrew declares a
+    /// LeaveTime later.
     fn talker_leave_all(&mut self, since: Duration) {
         self.talker_leave_alls += 1;
         let heard = self.talker_leave_alls;
@@ -3808,10 +3865,10 @@ impl Runtime {
         }
         for out in self.outs() {
             let output = self.output_mut(out);
-            if let Some(from) = output.grown_from
+            if let Some(from) = output.changed_from
                 && heard - from >= GROWN_LEAVE_ALLS
             {
-                output.grown_from = None;
+                output.changed_from = None;
                 output.redeclare_at = output.redeclare_at.map(|at| at.min(since + GROWN_AFTER));
             }
         }
@@ -6564,6 +6621,68 @@ mod tests {
         let class_a = declared(StreamFormat(0x0205_0220_0200_6000), PRIORITY);
         let as_class_b = declared(StreamFormat(0x0205_0220_0200_6000), CLASS_B_PRIORITY);
         assert_eq!(class_a, 2 * as_class_b);
+    }
+
+    /// With `new_stream_id_on_change`, a talker goes on under another
+    /// stream ID whenever what a bridge reserves for it changes, smaller or
+    /// in another class as well as larger: a pool talker that declared 32
+    /// channels in class A and connects to esp-amp's 2 in class B, which
+    /// the MOTU switch went on reserving as the 32 in class A. A format
+    /// whose frames and class stay as they were keeps its ID. Without it,
+    /// only a stream that grew moves, as before.
+    #[test]
+    fn a_changed_reservation_takes_another_stream_id() {
+        let declared = |format: StreamFormat| {
+            let media = avb_stream::media::Media::of(format).unwrap();
+            let priority = if format.is_class_b() {
+                CLASS_B_PRIORITY
+            } else {
+                PRIORITY
+            };
+            TalkerDeclaration {
+                stream_id: 1,
+                destination: MacAddress([0x91, 0xe0, 0xf0, 0, 0x78, 0xb9]),
+                vlan_id: VLAN,
+                max_frame_size: media.pdu_length() as u16,
+                max_interval_frames: 1,
+                priority,
+                rank: true,
+                accumulated_latency: TALKER_LATENCY,
+                failure: None,
+                event: avb_mrp::Event::New,
+            }
+        };
+        let pool = declared(formats::aaf(48_000, 32, 32, formats::CLASS_A_FRAMES));
+        let esp_amp = declared(StreamFormat(0x0205_0220_0080_c000));
+        assert_eq!(pool.max_frame_size, 792);
+        assert_eq!(pool.priority, PRIORITY);
+        assert_eq!(esp_amp.max_frame_size, 120);
+        assert_eq!(esp_amp.priority, CLASS_B_PRIORITY);
+        let moves = |before: &TalkerDeclaration, now: &TalkerDeclaration, any_change| {
+            Reservation::of(before).moves_for(now, any_change)
+        };
+        // Smaller, in another class: the MOTU's case, which moves only
+        // with the option.
+        assert!(moves(&pool, &esp_amp, true));
+        assert!(!moves(&pool, &esp_amp, false));
+        // Larger: moves either way.
+        assert!(moves(&esp_amp, &pool, true));
+        assert!(moves(&esp_amp, &pool, false));
+        // Smaller in the same class.
+        let two_a = declared(formats::aaf(48_000, 2, 32, formats::CLASS_A_FRAMES));
+        assert!(moves(&pool, &two_a, true));
+        assert!(!moves(&pool, &two_a, false));
+        // The same frames in the other class.
+        let mut two_b = two_a;
+        two_b.priority = CLASS_B_PRIORITY;
+        assert!(moves(&two_a, &two_b, true));
+        assert!(!moves(&two_a, &two_b, false));
+        // Unchanged, whatever else the declaration carries.
+        let mut moved = esp_amp;
+        moved.stream_id = 2;
+        moved.accumulated_latency = 2 * TALKER_LATENCY;
+        assert!(!moves(&esp_amp, &moved, true));
+        assert!(!moves(&esp_amp, &moved, false));
     }
 
     /// A class B talker offers class B's formats first, so a frame each

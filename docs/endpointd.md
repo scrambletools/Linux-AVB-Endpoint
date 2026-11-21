@@ -827,6 +827,20 @@ count, such as a 6-channel amp input, connects as it is set (the user,
     talker is any but the default entity's pool talkers, this
     computer's own included: a listener plaa's or triib's talker here
     feeds is busy (fixed in 0.3.1; 0.3.0 counted it free).
+  - **A changed reservation:** a pool talker takes each listener's
+    format, so its reservation changes from one connect to the next.
+    It withdraws its Talker Advertise and declares the new one on the
+    same stream ID 2 s later, or under the next of its four stream IDs
+    when the stream grew, as a bridge polices a stream to the frame
+    size it first registered. Some bridges keep the whole old
+    reservation for a stream ID while it stays declared: the MOTU
+    switch went on reserving a stream that changed from 32 channels in
+    class A to 2 in class B as class A for over an hour, so the next
+    bridge held the class B frames to its 1 Mbit/s class B floor and
+    dropped most of them. `new_stream_id_on_change =
+    true` in the file moves a talker to its next stream ID whenever
+    its frame size, frames each interval or class change, smaller as
+    well as larger. It is off by default (0.3.5).
   - **Releasing:** after the last app stream unlinks, and 30 s more, the
     daemon disconnects, so pauses, seeks and track changes don't cost an
     ACMP and MSRP round each. It disconnects only a binding it made that
