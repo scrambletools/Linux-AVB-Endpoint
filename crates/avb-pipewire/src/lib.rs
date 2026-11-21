@@ -45,12 +45,29 @@ impl VirtualDevice {
         self.shared.clone()
     }
 
-    /// Whether an app plays into it or records from it: PipeWire runs
-    /// it while an app's stream is linked to it, and suspends it a few
-    /// seconds after the last goes.
+    /// Whether an app plays into it or records from it: whether a link
+    /// ends at its node on the apps' side. Not whether PipeWire runs it,
+    /// as its node runs, with no link, whenever its driver runs for
+    /// another app's sound.
     pub fn in_use(&self) -> bool {
         self.in_use.load(Ordering::Relaxed)
     }
+}
+
+/// Whether a device's `node` has an app's link among `links`, each a
+/// link's output and input nodes: one into a playback device's input,
+/// or out of a recording device's output. A node PipeWire has yet to
+/// give, `u32::MAX`, has none.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linked(links: impl IntoIterator<Item = (u32, u32)>, node: u32, playback: bool) -> bool {
+    node != u32::MAX
+        && links.into_iter().any(|(output, input)| {
+            if playback {
+                input == node
+            } else {
+                output == node
+            }
+        })
 }
 
 /// The thread that runs PipeWire and its devices. Dropping it removes
@@ -96,8 +113,10 @@ impl VirtualAudio {
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::io;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread::JoinHandle;
@@ -108,6 +127,24 @@ mod imp {
     use pw::spa;
 
     use super::DeviceSpec;
+
+    /// PipeWire's links, by ID: each one's output and input nodes.
+    type Links = Rc<RefCell<HashMap<u32, (u32, u32)>>>;
+
+    /// What tells whether a device is in use: its node, once PipeWire
+    /// gives it one, and the way apps' links reach it.
+    struct Usage {
+        node: Cell<u32>,
+        playback: bool,
+        in_use: Arc<AtomicBool>,
+    }
+
+    impl Usage {
+        fn update(&self, links: &HashMap<u32, (u32, u32)>) {
+            let linked = super::linked(links.values().copied(), self.node.get(), self.playback);
+            self.in_use.store(linked, Ordering::Relaxed);
+        }
+    }
 
     /// What the loop's thread is asked to do.
     enum Command {
@@ -207,11 +244,12 @@ mod imp {
         }
     }
 
-    /// A device the loop owns: its stream and the listener its callbacks
-    /// live in.
+    /// A device the loop owns: its stream, the listener its callbacks
+    /// live in, and what tells whether it is in use.
     struct Device {
         _stream: pw::stream::StreamRc,
         _listener: pw::stream::StreamListener<()>,
+        usage: Rc<Usage>,
     }
 
     /// The rate when PipeWire names none.
@@ -253,10 +291,11 @@ mod imp {
             let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(error)?;
             let context = pw::context::ContextRc::new(&mainloop, None).map_err(error)?;
             let core = context.connect_rc(None).map_err(error)?;
+            let registry = core.get_registry_rc().map_err(error)?;
             let rate = graph_rate(&mainloop, &core)?;
-            Ok::<_, io::Error>((mainloop, context, core, rate))
+            Ok::<_, io::Error>((mainloop, context, core, registry, rate))
         })();
-        let (mainloop, _context, core, rate) = match made {
+        let (mainloop, _context, core, registry, rate) = match made {
             Ok(made) => made,
             Err(failure) => {
                 let _ = started.send(Err(failure));
@@ -264,7 +303,55 @@ mod imp {
             }
         };
         let _ = started.send(Ok(rate));
-        let devices: std::rc::Rc<std::cell::RefCell<HashMap<u64, Device>>> = Default::default();
+        let devices: Rc<RefCell<HashMap<u64, Device>>> = Default::default();
+        // Every device's usage, apart from the devices, so the registry's
+        // callbacks never borrow them as they come and go.
+        let usages: Rc<RefCell<HashMap<u64, Rc<Usage>>>> = Default::default();
+        let links: Links = Default::default();
+        let update_all = {
+            let usages = usages.clone();
+            let links = links.clone();
+            move || {
+                let links = links.borrow();
+                for usage in usages.borrow().values() {
+                    usage.update(&links);
+                }
+            }
+        };
+        let _registry_listener = {
+            let added = links.clone();
+            let removed = links.clone();
+            let after_add = update_all.clone();
+            let after_remove = update_all;
+            registry
+                .add_listener_local()
+                .global(move |global| {
+                    if global.type_ != pw::types::ObjectType::Link {
+                        return;
+                    }
+                    let node = |key: &str| {
+                        global
+                            .props
+                            .and_then(|props| props.get(key))
+                            .and_then(|value| value.parse::<u32>().ok())
+                    };
+                    let (Some(output), Some(input)) = (
+                        node(*pw::keys::LINK_OUTPUT_NODE),
+                        node(*pw::keys::LINK_INPUT_NODE),
+                    ) else {
+                        return;
+                    };
+                    added.borrow_mut().insert(global.id, (output, input));
+                    after_add();
+                })
+                .global_remove(move |id| {
+                    let gone = removed.borrow_mut().remove(&id).is_some();
+                    if gone {
+                        after_remove();
+                    }
+                })
+                .register()
+        };
         let quit = mainloop.clone();
         let owned = devices.clone();
         let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
@@ -275,12 +362,14 @@ mod imp {
                 in_use,
                 done,
             } => {
-                let result = add(&core, &spec, buffer, in_use).map(|device| {
+                let result = add(&core, &spec, buffer, in_use, links.clone()).map(|device| {
+                    usages.borrow_mut().insert(id, device.usage.clone());
                     owned.borrow_mut().insert(id, device);
                 });
                 let _ = done.send(result);
             }
             Command::Remove(id) => {
+                usages.borrow_mut().remove(&id);
                 owned.borrow_mut().remove(&id);
             }
             Command::Quit => quit.quit(),
@@ -338,7 +427,13 @@ mod imp {
         spec: &DeviceSpec,
         buffer: Arc<FrameBuffer>,
         in_use: Arc<AtomicBool>,
+        links: Links,
     ) -> io::Result<Device> {
+        let usage = Rc::new(Usage {
+            node: Cell::new(u32::MAX),
+            playback: spec.playback,
+            in_use,
+        });
         let channels = usize::from(spec.channels.max(1));
         let stream = pw::stream::StreamRc::new(
             core.clone(),
@@ -364,13 +459,14 @@ mod imp {
         let rate = spec.rate;
         let playback = spec.playback;
         let mut samples: Vec<f32> = Vec::new();
+        let watched = usage.clone();
         let listener = stream
             .add_local_listener_with_user_data(())
-            .state_changed(move |_, _, _, now| {
-                in_use.store(
-                    matches!(now, pw::stream::StreamState::Streaming),
-                    Ordering::Relaxed,
-                );
+            // Its node, once PipeWire gives it one: the links counted
+            // against it are those ending there.
+            .state_changed(move |stream, _, _, _| {
+                watched.node.set(stream.node_id());
+                watched.update(&links.borrow());
             })
             .io_changed(move |_, _, id, area, _| {
                 if id == spa::sys::SPA_IO_Position {
@@ -445,6 +541,7 @@ mod imp {
         Ok(Device {
             _stream: stream,
             _listener: listener,
+            usage,
         })
     }
 }
@@ -484,6 +581,28 @@ mod imp {
         ) -> io::Result<Remover> {
             Ok(Remover)
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::linked;
+
+    /// A playback device is in use by links into it, a recording device by
+    /// links out of it; a node not given yet by none, and other nodes'
+    /// links never count.
+    #[test]
+    fn a_device_is_in_use_by_the_links_ending_at_it() {
+        // An app (40) plays into the sink (70); the source (71) feeds a
+        // recorder (41); another app plays to the speakers (42 to 50).
+        let links = [(40, 70), (71, 41), (42, 50)];
+        assert!(linked(links, 70, true));
+        assert!(!linked(links, 70, false), "nothing records from the sink");
+        assert!(linked(links, 71, false));
+        assert!(!linked(links, 71, true), "nothing plays into the source");
+        assert!(!linked(links, 72, true), "its driver runs, but no link");
+        assert!(!linked([], 70, true));
+        assert!(!linked([(40, u32::MAX)], u32::MAX, true), "no node yet");
     }
 }
 
@@ -542,21 +661,31 @@ mod tests {
         }
         std::fs::write(&tone, wav).expect("written");
         let shared = playback.shared();
+        assert!(!playback.in_use(), "nothing linked yet");
         let mut player = Command::new("pw-play")
             .args(["--target", "avb-test-out"])
             .arg(&tone)
             .spawn()
             .expect("pw-play");
         let mut loudest = 0.0f32;
+        let mut used = false;
         let mut taken = vec![0.0f32; 2 * 480];
         let until = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
             shared.buffer.pull(&mut taken);
             loudest = loudest.max(peak(&taken));
+            used |= playback.in_use();
         }
         let _ = player.wait();
         assert!(loudest > 0.4, "played at half scale, heard {loudest}");
+        assert!(used, "in use while pw-play's link lasted");
+        // The link goes with pw-play, whatever else keeps the graph running.
+        let until = Instant::now() + Duration::from_secs(2);
+        while playback.in_use() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!playback.in_use(), "no longer in use once its link went");
         // The recording device gives what the stream writes.
         let recorded = dir.join("avb-test-recorded.raw");
         let feeding = recording.shared();

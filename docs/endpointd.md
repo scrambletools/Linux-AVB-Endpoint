@@ -852,7 +852,11 @@ count, such as a 6-channel amp input, connects as it is set (the user,
     well as larger. It is off by default (0.3.5).
   - **Releasing:** after the last app stream unlinks, and 30 s more, the
     daemon disconnects, so pauses, seeks and track changes don't cost an
-    ACMP and MSRP round each. It disconnects only a binding it made that
+    ACMP and MSRP round each. A device counts as in use while a PipeWire
+    link ends at it. Through 0.3.5 it counted while its node ran, which it
+    does with no link whenever its driver runs for another app's sound,
+    so a destination stayed connected, sending silence, while anything
+    else played. It disconnects only a binding it made that
     no one has changed since. A device hidden or unpinned while
     connected is disconnected at once, so its listener doesn't stay
     bound to a pool talker that may go to another device next; and a
