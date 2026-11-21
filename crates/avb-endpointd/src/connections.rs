@@ -73,6 +73,9 @@ pub struct Connections {
     /// Devices whose connect failed, not tried again until no app uses
     /// them.
     refused: BTreeSet<RemoteStream>,
+    /// Devices whose listener was read unbound while connected, and so
+    /// connected again, once until no app uses them.
+    rebound: BTreeSet<RemoteStream>,
     /// Pool listeners another controller bound, which no source takes
     /// until they are unbound.
     held: BTreeSet<u16>,
@@ -88,6 +91,7 @@ impl Connections {
             links: BTreeMap::new(),
             starved: Vec::new(),
             refused: BTreeSet::new(),
+            rebound: BTreeSet::new(),
             held: BTreeSet::new(),
         }
     }
@@ -126,10 +130,12 @@ impl Connections {
             }
         });
         // A device no app uses may be tried again once one does.
-        self.refused.retain(|stream| {
+        let in_use = |stream: &RemoteStream| {
             seen.iter()
                 .any(|device| device.stream == *stream && device.in_use)
-        });
+        };
+        self.refused.retain(in_use);
+        self.rebound.retain(in_use);
         for device in seen {
             match self.links.get_mut(&device.stream) {
                 Some(link) => {
@@ -185,6 +191,23 @@ impl Connections {
         } else {
             self.links.remove(stream);
             self.refused.insert(*stream);
+        }
+    }
+
+    /// A destination the daemon connected whose listener the controller now
+    /// reads unbound, by another controller or by the device: its
+    /// connection is forgotten, and while an app uses it the next update
+    /// connects it again, as one free again after another controller's
+    /// binding is; but once only until no app uses it, so a listener that
+    /// keeps letting go, or a controller that keeps unbinding it, is left
+    /// unconnected. Whether it connects again.
+    pub fn unbound(&mut self, stream: &RemoteStream) -> bool {
+        self.links.remove(stream);
+        if self.rebound.insert(*stream) {
+            true
+        } else {
+            self.refused.insert(*stream);
+            false
         }
     }
 
@@ -385,6 +408,48 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(connections.pool(&main), None);
+    }
+
+    /// A connected destination whose listener lets go of the binding while
+    /// the app plays on is connected again at once; letting go a second
+    /// time leaves it unconnected until the app stops and plays again.
+    #[test]
+    fn an_unbound_listener_is_connected_again_once() {
+        let mut connections = Connections::new(4, 4);
+        let main = speaker(0);
+        connections.update(secs(0), &[seen(main, true, DeviceState::Idle)]);
+        connections.connected(&main, true);
+        assert_eq!(connections.state(&main), Some(DeviceState::Connected));
+        // Read unbound: no longer connected, and connected again.
+        assert!(connections.unbound(&main));
+        assert_eq!(connections.state(&main), None);
+        assert_eq!(connections.pool(&main), None);
+        assert_eq!(
+            connections.update(secs(1), &[seen(main, true, DeviceState::Idle)]),
+            vec![Action::Connect {
+                stream: main,
+                pool: 0
+            }]
+        );
+        connections.connected(&main, true);
+        // Again: left be while the app goes on.
+        assert!(!connections.unbound(&main));
+        assert!(
+            connections
+                .update(secs(2), &[seen(main, true, DeviceState::Idle)])
+                .is_empty()
+        );
+        assert_eq!(connections.state(&main), None);
+        // The app stops and plays again: connected, with one more go.
+        connections.update(secs(3), &[seen(main, false, DeviceState::Idle)]);
+        assert_eq!(
+            connections
+                .update(secs(4), &[seen(main, true, DeviceState::Idle)])
+                .len(),
+            1
+        );
+        connections.connected(&main, true);
+        assert!(connections.unbound(&main));
     }
 
     /// A device no longer shown is disconnected at once, app or not, and

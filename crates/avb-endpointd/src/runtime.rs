@@ -1922,6 +1922,7 @@ impl Runtime {
         let now = self.now();
         let since = self.elapsed();
         self.check_pool_listeners();
+        self.check_destinations();
         // A controller only apps' binds started looks after no device's
         // listeners.
         if self.config.wants_devices() {
@@ -2065,6 +2066,48 @@ impl Runtime {
             .map(|(pool, _)| pool)
             .collect();
         self.connections.set_held_listeners(held);
+    }
+
+    /// Takes up each destination the daemon connected whose listener the
+    /// controller now reads unbound, as another controller's disconnect or
+    /// the device's own word leaves it: its device no longer says
+    /// connected, and while apps play into it the connections connect it
+    /// again this turn, once, until apps stop playing into it and start
+    /// again. One that restarts instead is read afresh, going off the list
+    /// while it is, and is connected again as it comes back. One bound to
+    /// another talker is busy, which the connections forget.
+    fn check_destinations(&mut self) {
+        let Some(index) = self.default_index() else {
+            return;
+        };
+        let unbound: Vec<(RemoteStream, u16)> = self
+            .connections
+            .links()
+            .into_iter()
+            .filter(|(stream, _)| {
+                stream.way == Way::Destination
+                    && self.connections.state(stream) == Some(devices::DeviceState::Connected)
+                    && self
+                        .found
+                        .iter()
+                        .any(|found| found.stream == *stream && found.bound_to.is_none())
+            })
+            .collect();
+        for (stream, pool) in unbound {
+            if let Some(output) = self.endpoints[index].pool_output(pool) {
+                self.output_mut(Out(index, output)).pool_source = None;
+            }
+            let name = self.stream_name(&stream);
+            if self.connections.unbound(&stream) {
+                log(format!(
+                    "{name}: its listener was unbound, connecting it again"
+                ));
+            } else {
+                log(format!(
+                    "{name}: its listener was unbound again, so it stays unconnected until apps stop playing into it and start again"
+                ));
+            }
+        }
     }
 
     /// Lets go of each listener on another device bound to one of the

@@ -827,6 +827,15 @@ count, such as a 6-channel amp input, connects as it is set (the user,
     talker is any but the default entity's pool talkers, this
     computer's own included: a listener plaa's or triib's talker here
     feeds is busy (fixed in 0.3.1; 0.3.0 counted it free).
+  - **Unbound:** a listener the daemon connected that its controller
+    then reads unbound, after another controller's disconnect or the
+    device's own word, no longer shows as connected. While apps play
+    into it the daemon connects it again at once, but only once until
+    apps stop playing into it and start again, so it never fights a
+    controller that keeps unbinding it (0.3.5; before, the device stayed
+    "connected" and silent until apps stopped for 30 s). A listener that
+    restarts is read afresh and connected again as it comes back, as
+    before.
   - **A changed reservation:** a pool talker takes each listener's
     format, so its reservation changes from one connect to the next.
     It withdraws its Talker Advertise and declares the new one on the
