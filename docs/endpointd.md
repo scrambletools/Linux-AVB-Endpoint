@@ -259,6 +259,11 @@ name = "Host entity 1"
 # streams as triib writes them now
 ```
 
+A top-level setting a version doesn't know, as a newer version's, is
+written back as it was by every edit from main after 0.3.5 on. 0.3.5 and
+earlier drop it: triib's 0.3.4 CLI dropped 0.3.5's
+`new_stream_id_on_change` this way.
+
 ### The default entity
 
 One entity on each interface is the default, `default = true`: this

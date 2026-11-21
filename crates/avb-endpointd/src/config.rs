@@ -84,7 +84,23 @@ pub struct Config {
     /// as an app first used them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin: Vec<DeviceEntry>,
+    /// The file's top-level settings this version doesn't know, a newer
+    /// version's: written back as they were, so an older daemon or app
+    /// editing the file never drops them, as 0.3.4 dropped 0.3.5's
+    /// `new_stream_id_on_change`.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
+
+/// Settings a file holds that this version doesn't know, kept as they are.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Unknown(pub toml::Table);
+
+// So the whole file stays comparable: a NaN among settings this version
+// doesn't know would only have a file read as changed once more, which
+// changes nothing this version does.
+impl Eq for Unknown {}
 
 impl Default for Config {
     fn default() -> Self {
@@ -101,6 +117,7 @@ impl Default for Config {
             endpoints: Vec::new(),
             hide: Vec::new(),
             pin: Vec::new(),
+            unknown: Unknown::default(),
         }
     }
 }
@@ -1054,6 +1071,9 @@ pub fn triib_entities_at(path: &Path, interface: &str) -> Option<Config> {
     if named.interface != interface || config.endpoints.is_empty() {
         return None;
     }
+    // triib's own keys, its interface among them, are no settings of the
+    // daemon's file.
+    config.unknown = Unknown::default();
     config.pin_instances();
     for endpoint in &mut config.endpoints {
         endpoint.model.get_or_insert_with(|| "triib".into());
@@ -1466,6 +1486,45 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings a newer version wrote, top-level values and tables alike,
+    /// come back as they were after an edit by this one, before and after
+    /// the entities; what this version knows reads as ever.
+    #[test]
+    fn an_edit_keeps_settings_it_does_not_know() {
+        let dir = scratch("unknown");
+        let path = dir.join("enp6s0.toml");
+        std::fs::write(
+            &path,
+            "future_switch = true\navb_lite = \"off\"\nfuture_count = 3\n\
+             [future_table]\nwhat = \"kept\"\n\
+             [[endpoint]]\ninstance = 112\ndefault = true\nname = \"desk\"\n",
+        )
+        .unwrap();
+        let read = load(&path).unwrap();
+        assert_eq!(read.avb_lite, LiteChoice::Off);
+        assert_eq!(read.endpoints.len(), 1);
+        assert_eq!(read.unknown.0.len(), 3, "{:?}", read.unknown);
+        edit_at(&path, |config| {
+            config.endpoints[0].name = "renamed".into();
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let after = load(&path).unwrap();
+        assert_eq!(after.endpoints[0].name, "renamed");
+        assert_eq!(after.unknown, read.unknown, "{text}");
+        assert_eq!(after.avb_lite, LiteChoice::Off);
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table["future_switch"], toml::Value::Boolean(true));
+        assert_eq!(table["future_count"], toml::Value::Integer(3));
+        assert_eq!(table["future_table"]["what"].as_str(), Some("kept"));
+        // A setting this version knows, now at its default, is no
+        // unknown one brought back.
+        edit_at(&path, |config| config.avb_lite = LiteChoice::default()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("avb_lite = \"off\""), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
