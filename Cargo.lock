@@ -51,9 +51,9 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "atdecc"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764b1d0072bf4e0dcb3b461b329c3481734512a5e1aad960c41c1c342c6b8b31"
+checksum = "b71b2eaf9679ef6889f786b57adb14c52a00f4bbe571b893b615cb3062df2bff"
 dependencies = [
  "avb-mrp",
  "avb-net",
@@ -120,9 +120,9 @@ dependencies = [
 
 [[package]]
 name = "avb-stream"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2a664bb38e50b261d4335e2d13e3b3d770a274e66413685cdcbe22d82d3e44"
+checksum = "a5efcabf1203cf6d0fe79cedd47e2541c6812e0263e5140651da51d08f78dae4"
 dependencies = [
  "atdecc",
  "avb-net",
@@ -378,9 +378,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gptp"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54a135d78e91887574b20b2bab724f024709a75505ec54f0f59bf4eab5504bad"
+checksum = "bec299fb0ed734e519d1b004d67a7a7946e33090e2cc65b383987154909e94e1"
 
 [[package]]
 name = "hashbrown"
