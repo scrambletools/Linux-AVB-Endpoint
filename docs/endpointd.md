@@ -162,6 +162,30 @@ The daemon and the apps no longer ship together, so:
   - The first transmit queue gets fq_codel, whatever the system's
     default. The bench found fq there made frames arrive late, stamped
     or not; departure times wait for a card that keeps them itself.
+  - Interrupt moderation is opt-in. Where
+    `/etc/avb-link/<interface>.conf` holds `RX_USECS=<microseconds>`,
+    avb-link@ sets the interface's rx-usecs to it, and with no such
+    file it leaves moderation alone.
+    - On the robotics bench, igc's default, 3, is dynamic and
+      conservative: under bulk traffic it fell to about 4000 interrupts
+      a second. `RX_USECS=0` took the loaded 99.9th percentile from
+      about 520 us to 167-201 us, with no missed deadlines.
+    - It's set only where the interface reads another value, so a
+      driver that restarts its link to change it (ixgbe, where that
+      turns LRO off or on) does so once. The journal says when the link
+      went down. A link that was up is watched for a second after the
+      change, and one that went down is waited for, up to ten seconds,
+      before EEE and PAUSE are checked.
+    - A driver's refusal, or a value that isn't a number, is logged and
+      skipped, and the rest of the unit runs.
+    - On the robotics bench, igc served a receive and a transmit queue
+      on each interrupt, so rx-usecs moderated both, and it refused
+      tx-usecs. The unit sets only rx-usecs and reads both back into
+      the journal.
+    - Every run with the file logs the value, as a change or as already
+      in place, so the journal shows it's in effect after a reboot.
+    - The value lasts until the driver starts again. Removing the file
+      leaves it as it is; `RX_USECS=3` puts igc's default back.
   - The daemon retries the link unit after a refusal, as it retries
     gptpd's start. Today start_link runs once.
   - While the three names can be live, an active avb-, triib- or
@@ -590,7 +614,8 @@ The link units stay as they are.
     one on, and at each desktop login after;
   - a helper may open raw network sockets;
   - starting the link unit changes the interface's transmit settings,
-    EEE and PAUSE, and the link reconnects once if EEE or PAUSE were on.
+    EEE and PAUSE, and the link reconnects once if EEE or PAUSE were on;
+    it changes interrupt moderation only where `/etc/avb-link` asks.
 - **plaa and triib** each install their model files and depend on
   avb-endpointd, as plaa's AVB on Linux already needs gptpd.
 
@@ -606,6 +631,10 @@ The link units stay as they are.
     streams, each give a new ID, and a new firmware version doesn't;
   - importing triib's file;
   - stable node names.
+- **Link unit:** `packaging/tests/test-link-unit.sh` runs avb-link@'s
+  script as systemd would, with ethtool, tc and ip standing in. CI runs
+  it on the repository's unit, and each package's test on the one it
+  installed.
 - **One host:**
   - triib's entities beside the default entity on one daemon;
   - an older plaa's entity at 0x70 holding the default off the network;

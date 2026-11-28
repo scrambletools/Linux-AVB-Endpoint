@@ -57,6 +57,12 @@ grep -q '^ExecStart=/usr/bin/avb-endpointd --interface %i$' \
     fail "the user unit does not run /usr/bin/avb-endpointd"
 grep -q '^firmware_version = "[0-9]' /usr/share/avb-endpointd/models/avb-endpointd.toml ||
     fail "the default entity's model has no firmware version"
+# Interrupt moderation is opt-in: the link unit reads a file in
+# /etc/avb-link where one is put there, and the package puts none.
+grep -qx 'EnvironmentFile=-/etc/avb-link/%i.conf' /usr/lib/systemd/system/avb-link@.service ||
+    fail "the link unit reads no /etc/avb-link file"
+[ ! -e /etc/avb-link ] || fail "the package puts /etc/avb-link in place"
+"$(dirname "$0")/test-link-unit.sh" /usr/lib/systemd/system/avb-link@.service
 caps=$(getcap /usr/lib/avb-endpointd/avb-netraw)
 case $caps in
 *cap_net_raw=ep*) ;;

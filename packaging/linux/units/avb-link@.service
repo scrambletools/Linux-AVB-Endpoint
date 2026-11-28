@@ -41,9 +41,29 @@ Before=gptpd@%i.service
 # each holds, so it is left alone where it is set already. A card with
 # one queue has fq_codel at its root. An fq_codel already there is kept,
 # and anything else, such as the fq older link units set, is replaced.
+#
+# Interrupt moderation is opt-in: where /etc/avb-link/<interface>.conf
+# sets RX_USECS, the interface's rx-usecs is set to it, RX_USECS=0 for
+# none, and with no such file nothing about it changes. igc's default,
+# 3, is dynamic and conservative: under bulk traffic it falls to about
+# 4000 interrupts a second, some 245 us apart, and on the robotics bench
+# 0 took the loaded 99.9th percentile from about 520 us to 167-201 us.
+# There, igc's interrupts each served a receive and a transmit queue,
+# rx-usecs moderated both, and tx-usecs was refused, so only rx-usecs is
+# set, and the journal reads back both, as it says the value at every
+# run. It is set only where the interface reads another value, so a
+# driver that restarts its link to change it (ixgbe, where that turns
+# LRO off or on) does so once, and the journal says so. A link that was
+# up is watched for a second after, as a driver may restart it a moment
+# later, and one that went down is waited for, up to ten seconds, before
+# EEE and PAUSE are checked on it. A driver's refusal, or a value that
+# is no number, is logged and left, and the rest goes on. The value
+# lasts until the driver starts again: taking the file away leaves it as
+# it is, and RX_USECS=3 puts igc's default back.
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+EnvironmentFile=-/etc/avb-link/%i.conf
 ExecStart=/bin/sh -c '\
     state() { ethtool --show-eee "$$1"; ethtool --show-pause "$$1"; } 2>/dev/null; \
     speed=0; tries=0; \
@@ -78,6 +98,38 @@ ExecStart=/bin/sh -c '\
         echo 0 >"$$queue/xps_cpus"; done 2>/dev/null; \
     cat /proc/irq/default_smp_affinity 2>/dev/null \
         >"/sys/class/net/$$1/queues/tx-0/xps_cpus"; \
+    if [ -n "$${RX_USECS:-}" ]; then \
+        case $$RX_USECS in \
+        *[!0-9]* | 0?*) \
+            echo "$$1: RX_USECS=$$RX_USECS is no number of microseconds, left as it is" >&2 ;; \
+        *) \
+            coalesce() { ethtool --show-coalesce "$$1" 2>/dev/null \
+                | sed -n "s/^$$2:[[:space:]]*//p"; }; \
+            was=$$(coalesce "$$1" rx-usecs); \
+            if [ "$$was" = "$$RX_USECS" ]; then \
+                echo "$$1: rx-usecs $$RX_USECS, as /etc/avb-link/$$1.conf asks"; \
+            else \
+                net="/sys/class/net/$$1"; \
+                carrier=$$(cat "$$net/carrier" 2>/dev/null); \
+                downs=$$(cat "$$net/carrier_down_count" 2>/dev/null); \
+                if why=$$(ethtool --coalesce "$$1" rx-usecs "$$RX_USECS" 2>&1); then \
+                    echo "$$1: rx-usecs $${was:-unknown} to $$(coalesce "$$1" rx-usecs), tx-usecs now $$(coalesce "$$1" tx-usecs), as /etc/avb-link/$$1.conf asks"; \
+                    tries=0; \
+                    while [ "$$carrier" = 1 ] && [ $$tries -lt 10 ] \
+                        && [ "$$(cat "$$net/carrier_down_count" 2>/dev/null)" = "$$downs" ]; do \
+                        tries=$$((tries + 1)); sleep 0.1; done; \
+                    if [ "$$(cat "$$net/carrier_down_count" 2>/dev/null)" != "$$downs" ]; then \
+                        echo "$$1: the link went down as rx-usecs changed" >&2; \
+                        tries=0; \
+                        while [ "$$(cat "$$net/carrier" 2>/dev/null)" != 1 ] && [ $$tries -lt 100 ]; do \
+                            tries=$$((tries + 1)); sleep 0.1; done; \
+                    fi; \
+                else \
+                    echo "$$1 refused rx-usecs $$RX_USECS, left as it is: $$why" >&2; \
+                fi; \
+            fi ;; \
+        esac; \
+    fi; \
     before=$$(state "$$1"); \
     ethtool --set-eee "$$1" eee off 2>/dev/null; \
     ethtool --pause "$$1" autoneg off rx off tx off 2>/dev/null \

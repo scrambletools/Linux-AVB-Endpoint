@@ -43,6 +43,10 @@ jobs:
       - name: Test, the daemon
         if: runner.os == 'Linux'
         run: cargo test -p avb-endpointd --features daemon --locked
+      # The link unit's script, with ethtool, tc and ip standing in.
+      - name: Test, the link unit
+        if: runner.os == 'Linux'
+        run: packaging/tests/test-link-unit.sh packaging/linux/units/avb-link@.service
 
   deny:
     runs-on: ubuntu-latest
